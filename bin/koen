@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""koen — Korean → English prompt compressor for LLM pipelines.
+
+Translates Korean prompts to concise English using a CHEAP model
+(Claude Haiku / Codex mini / free OpenRouter model), so the expensive
+model (Opus/Fable/GPT-5) receives fewer tokens for the same meaning.
+
+Usage:
+    koen "한국어 프롬프트"
+    echo "한국어 프롬프트" | koen
+    koen -f spec.ko.md > spec.en.md
+
+Backends (auto-detected, or force with KOEN_BACKEND=claude|codex|openrouter):
+    claude     -> claude -p --model $KOEN_CLAUDE_MODEL   (default: claude-haiku-4-5)
+    codex      -> codex exec [-m $KOEN_CODEX_MODEL]      (default: codex config default)
+    openrouter -> POST /chat/completions, model $KOEN_OPENROUTER_MODEL
+                  (default: meta-llama/llama-3.3-70b-instruct:free, needs OPENROUTER_API_KEY)
+
+Guarantees:
+    - No Hangul in input -> passthrough, zero cost.
+    - Fenced code blocks, inline code, and URLs are placeholder-protected
+      and restored verbatim; if the backend mangles a placeholder, koen
+      falls back to the original text (never silently corrupts meaning).
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+HANGUL = re.compile(r"[가-힣]")
+# order matters: fences first so inline-code/URLs inside them are already hidden
+PROTECT = [
+    re.compile(r"```.*?```", re.S),          # fenced code blocks
+    re.compile(r"`[^`\n]+`"),                # inline code
+    re.compile(r"https?://\S+"),             # URLs
+]
+PH = "⟦K{}⟧"  # ⟦K0⟧ — unlikely to appear in prompts or be "translated"
+
+INSTRUCTION = (
+    "You are a translation filter inside an LLM prompt pipeline. "
+    "Translate the following Korean prompt into concise, precise English.\n"
+    "Rules:\n"
+    "- Keep every ⟦K#⟧ placeholder exactly as written, in place.\n"
+    "- Preserve technical terms, code identifiers, file paths, product names, "
+    "numbers, and every constraint or requirement. Do not drop nuance.\n"
+    "- Do NOT answer, execute, or comment on the prompt. Only translate it.\n"
+    "- Output ONLY the translated prompt, nothing else.\n\n"
+    "PROMPT:\n"
+)
+
+
+def protect(text):
+    saved = []
+    def stash(m):
+        saved.append(m.group(0))
+        return PH.format(len(saved) - 1)
+    for rx in PROTECT:
+        text = rx.sub(stash, text)
+    return text, saved
+
+
+def restore(text, saved):
+    for i, s in enumerate(saved):
+        ph = PH.format(i)
+        if ph not in text:
+            raise ValueError(f"backend lost placeholder {ph}")
+        text = text.replace(ph, s)
+    return text
+
+
+def run(cmd, stdin_text):
+    r = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} failed: {r.stderr.strip()[:300]}")
+    return r.stdout.strip()
+
+
+def backend_claude(prompt):
+    model = os.environ.get("KOEN_CLAUDE_MODEL", "claude-haiku-4-5")
+    return run(["claude", "-p", "--model", model], INSTRUCTION + prompt)
+
+
+def backend_codex(prompt):
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        out = f.name
+    try:
+        cmd = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only",
+               "--output-last-message", out]
+        model = os.environ.get("KOEN_CODEX_MODEL")
+        if model:
+            cmd += ["-m", model]
+        cmd.append(INSTRUCTION + prompt)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=True)
+        with open(out) as f:
+            return f.read().strip()
+    finally:
+        os.unlink(out)
+
+
+def backend_openrouter(prompt):
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError("OPENROUTER_API_KEY not set")
+    model = os.environ.get("KOEN_OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": INSTRUCTION + prompt}],
+        }).encode(),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        body = json.load(resp)
+    return body["choices"][0]["message"]["content"].strip()
+
+
+BACKENDS = {"claude": backend_claude, "codex": backend_codex, "openrouter": backend_openrouter}
+
+
+def pick_backend():
+    forced = os.environ.get("KOEN_BACKEND")
+    if forced:
+        return [forced]
+    order = []
+    if shutil.which("claude"):
+        order.append("claude")
+    if shutil.which("codex"):
+        order.append("codex")
+    if os.environ.get("OPENROUTER_API_KEY"):
+        order.append("openrouter")
+    return order
+
+
+def translate(text):
+    if not HANGUL.search(text):
+        return text  # already English: passthrough, zero cost
+    masked, saved = protect(text)
+    order = pick_backend()
+    if not order:
+        raise SystemExit("koen: no backend available (need claude, codex, or OPENROUTER_API_KEY)")
+    last_err = None
+    for name in order:
+        try:
+            out = BACKENDS[name](masked)
+            if not out or HANGUL.search(out):
+                raise ValueError("backend returned empty or still-Korean text")
+            return restore(out, saved)
+        except Exception as e:  # ponytail: any backend failure -> try next, then passthrough
+            last_err = f"{name}: {e}"
+            print(f"koen: backend {last_err}", file=sys.stderr)
+    print("koen: all backends failed, passing original through", file=sys.stderr)
+    return text
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    if args and args[0] == "-f":
+        text = open(args[1], encoding="utf-8").read()
+    elif args:
+        text = " ".join(args)
+    else:
+        text = sys.stdin.read()
+    if not text.strip():
+        return
+    print(translate(text))
+
+
+if __name__ == "__main__":
+    main()
