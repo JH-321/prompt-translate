@@ -146,13 +146,26 @@ fn protect(text: &str) -> (String, Vec<String>) {
 }
 
 fn restore(text: &str, saved: &[String]) -> Result<String, String> {
-    let mut out = text.to_string();
-    for (i, s) in saved.iter().enumerate() {
-        let ph = placeholder(i);
-        if !out.contains(&ph) {
-            return Err(format!("backend lost placeholder {}", ph));
-        }
-        out = out.replace(&ph, s);
+    // Single pass over the masked text: each ⟦K#⟧ is substituted once and the
+    // inserted content is NOT rescanned, so a saved value that itself contains a
+    // placeholder token can't be clobbered by a later substitution.
+    let rx = regex::Regex::new(r"⟦K(\d+)⟧").unwrap();
+    let mut seen = vec![false; saved.len()];
+    let out = rx
+        .replace_all(text, |caps: &regex::Captures| match caps[1]
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| saved.get(i).map(|s| (i, s)))
+        {
+            Some((i, s)) => {
+                seen[i] = true;
+                s.clone()
+            }
+            None => caps[0].to_string(), // unknown index: leave verbatim
+        })
+        .into_owned();
+    if let Some(i) = seen.iter().position(|&s| !s) {
+        return Err(format!("backend lost placeholder {}", placeholder(i)));
     }
     Ok(out)
 }
@@ -736,7 +749,7 @@ fn clear_via_kill(baseline: &[char], master: libc::c_int) -> bool {
         return false;
     }
     for _ in 0..3 {
-        wr(master, &[0x15]); // Ctrl-U
+        wr_master(master, &[0x15]); // Ctrl-U
         for _ in 0..4 {
             pump(master, 15); // let claude redraw before checking
         }
@@ -782,6 +795,31 @@ fn wr(fd: libc::c_int, mut buf: &[u8]) {
     }
 }
 
+fn is_eagain() -> bool {
+    // EAGAIN and EWOULDBLOCK are the same value on macOS/Linux
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+}
+
+/// Write to the (non-blocking) pty master, draining the child's output whenever
+/// the write would block. Forwarding a large burst (e.g. a big paste) can fill
+/// the master's input buffer; a plain blocking write would then wedge while the
+/// child is itself blocked writing output we haven't read — a pty deadlock.
+/// Pumping between partial writes keeps both directions moving.
+fn wr_master(master: libc::c_int, mut buf: &[u8]) {
+    while !buf.is_empty() {
+        let n = unsafe { libc::write(master, buf.as_ptr() as *const _, buf.len()) };
+        if n > 0 {
+            buf = &buf[n as usize..];
+        } else if n < 0 && is_eagain() {
+            if !pump(master, 5) {
+                return; // child gone
+            }
+        } else {
+            return; // real write error (EPIPE, etc.)
+        }
+    }
+}
+
 /// poll a single fd for readability; returns true if readable
 fn readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -796,8 +834,11 @@ fn pump(master: libc::c_int, timeout_ms: libc::c_int) -> bool {
     if readable(master, timeout_ms) {
         let mut buf = [0u8; 65536];
         let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if n <= 0 {
-            return false;
+        if n < 0 {
+            return !is_eagain(); // EAGAIN on the non-blocking master: no data, not EOF
+        }
+        if n == 0 {
+            return false; // real EOF
         }
         screen_feed(&buf[..n as usize]); // keep the screen model in sync
         wr(1, &buf[..n as usize]);
@@ -908,7 +949,7 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         has_hangul(&text), translatable, total, clip(&text, 200)
     ));
     if !translatable {
-        wr(master, b"\r");
+        wr_master(master, b"\r");
         return Vec::new();
     }
     let (eng, held) = translate_while_pumping(&text, master);
@@ -939,16 +980,16 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
             // exact shadow: move a possibly mid-line cursor to the end, then one
             // backspace per char clears it. ponytail: if a wide-char mismatch
             // ever bites, count graphemes instead of chars.
-            wr(master, "\x1b[C".repeat(total.saturating_sub(cur_off)).as_bytes());
-            wr(master, &vec![0x7f; total]);
+            wr_master(master, "\x1b[C".repeat(total.saturating_sub(cur_off)).as_bytes());
+            wr_master(master, &vec![0x7f; total]);
             true
         };
         if cleared {
             if let Ok(p) = env::var("KOEN_ORIG_FILE") {
                 let _ = std::fs::write(p, &text); // shown by the UserPromptSubmit hook
             }
-            wr(master, eng.as_bytes());
-            wr(master, st.suffix.as_bytes());
+            wr_master(master, eng.as_bytes());
+            wr_master(master, st.suffix.as_bytes());
             // the TUI treats a rapid burst as a paste, and a \r inside a paste
             // inserts a newline instead of submitting — pause so the Enter
             // registers as its own keypress
@@ -961,7 +1002,7 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
             dbg_log("on_enter: paste box not cleared; submitting paste untranslated");
         }
     }
-    wr(master, b"\r");
+    wr_master(master, b"\r");
     held
 }
 
@@ -1044,7 +1085,7 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
                 // the shadow can no longer be trusted, so skip translation
                 _ => st.dirty = true,
             }
-            wr(master, seq);
+            wr_master(master, seq);
             i = end + 1;
         } else if (b == 0x0d || b == 0x0a) && !st.paste {
             let held = on_enter(st, master);
@@ -1058,14 +1099,14 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
             // newline inside pasted text: part of the input
             st.buf.insert(st.cursor, '\n');
             st.cursor += 1;
-            wr(master, &q[i..=i]);
+            wr_master(master, &q[i..=i]);
             i += 1;
         } else if b == 0x7f {
             if st.cursor > 0 {
                 st.buf.remove(st.cursor - 1); // delete the char before the cursor
                 st.cursor -= 1;
             }
-            wr(master, &q[i..=i]);
+            wr_master(master, &q[i..=i]);
             i += 1;
         } else if b == 0x03 || b == 0x15 {
             // ctrl-c / ctrl-u clear the input line
@@ -1074,14 +1115,14 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
             st.pend.clear();
             st.dirty = false;
             st.paste_seen = false;
-            wr(master, &q[i..=i]);
+            wr_master(master, &q[i..=i]);
             i += 1;
         } else {
             let mut j = i + 1;
             while j < q.len() && !SPECIAL.contains(&q[j]) {
                 j += 1;
             }
-            wr(master, &q[i..j]);
+            wr_master(master, &q[i..j]);
             let chunk: Vec<u8> = q[i..j].to_vec();
             feed_shadow(st, &chunk);
             i = j;
@@ -1089,7 +1130,29 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
     }
 }
 
+/// Remove koen temp files (koen-orig-<pid>.txt / koen-<pid>.txt) orphaned by a
+/// previously killed session — best effort, only when the owning pid is dead so
+/// a live session's file (even under a reused pid) is never touched.
+fn sweep_temp_files() {
+    let Ok(entries) = std::fs::read_dir(env::temp_dir()) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let rest = name
+            .strip_prefix("koen-orig-")
+            .or_else(|| name.strip_prefix("koen-"));
+        let Some(pid) = rest.and_then(|r| r.strip_suffix(".txt")).and_then(|r| r.parse::<i32>().ok())
+        else { continue };
+        let dead = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if dead {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn harness(target: &str, extra: &[String]) -> ! {
+    sweep_temp_files(); // clear leaks from previously killed sessions
     let mut args: Vec<String> = Vec::new();
     let mut it = extra.iter();
     while let Some(a) = it.next() {
@@ -1202,6 +1265,12 @@ fn harness(target: &str, extra: &[String]) -> ! {
     }
 
     MASTER_FD.store(master, std::sync::atomic::Ordering::Relaxed);
+    // non-blocking master so wr_master() can drain output on EAGAIN instead of
+    // deadlocking on a large forward; pump() tolerates EAGAIN reads too.
+    unsafe {
+        let fl = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
     *SCREEN.lock().unwrap() = Some(Screen::new(ws.ws_row as usize, ws.ws_col as usize));
     let mut old: libc::termios = unsafe { mem::zeroed() };
     if interactive {
@@ -1337,6 +1406,15 @@ mod tests {
         assert!(!masked.contains("```") && !masked.contains("https://") && !masked.contains("`inline`"));
         assert_eq!(saved.len(), 3);
         assert_eq!(restore(&masked, &saved).unwrap(), src);
+    }
+
+    #[test]
+    fn restore_keeps_nested_placeholder_token() {
+        // saved[0] literally contains a ⟦K1⟧ token; single-pass restore must not
+        // let the K1 substitution reach inside it.
+        let saved = vec!["literal ⟦K1⟧ text".to_string(), "SECOND".to_string()];
+        let out = restore("a ⟦K0⟧ b ⟦K1⟧ c", &saved).unwrap();
+        assert_eq!(out, "a literal ⟦K1⟧ text b SECOND c");
     }
 
     #[test]
