@@ -16,11 +16,17 @@ expensive model only ever sees English.
 
 ## When to use
 
-- The user gives you a **Korean file** (spec, PRD, issue) to work from.
-- The user asks to prepare/compress a Korean prompt for another model.
+Savings only happen when the Korean text has NOT yet entered the expensive
+model's context. That means:
 
-Do NOT use for short conversational Korean — just answer directly; the
-translation round-trip costs more than it saves.
+- The user names a **Korean file path** (spec, PRD, issue export) — do NOT
+  Read it yourself; pipe it through `koen -f` so only English enters context.
+- The user asks to prepare/compress a Korean prompt **for another model /
+  headless run** (`koen | claude -p`).
+
+Do NOT use when the Korean is already in the conversation (typed or pasted
+messages, file contents you already Read). Those tokens are already spent;
+translating them adds cost instead of saving it — just answer directly.
 
 ## How
 
