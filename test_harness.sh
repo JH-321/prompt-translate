@@ -31,6 +31,29 @@ case "$(cat "$cap")" in
   *) echo "FAIL codex suffix: $(cat "$cap")"; exit 1 ;;
 esac
 
+# stop hook: last_assistant_message field is preferred (no transcript needed)
+out=$(printf '{"last_assistant_message":"All done."}' | KOEN_FAKE_TRANSLATION="모두 완료했습니다." "$bin" --stop-hook)
+case "$out" in
+  '{"systemMessage":"모두 완료했습니다."}') ;;
+  *) echo "FAIL stop-hook direct: $out"; exit 1 ;;
+esac
+
+# stop hook: falls back to reading the transcript file
+tp="$dir/transcript.jsonl"
+printf '%s\n%s\n' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"draft"}]}}' \
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Done. I fixed the bug."}]}}' > "$tp"
+out=$(printf '{"transcript_path":"%s"}' "$tp" | KOEN_FAKE_TRANSLATION="버그를 고쳤습니다." "$bin" --stop-hook)
+case "$out" in
+  '{"systemMessage":"버그를 고쳤습니다."}') ;;
+  *) echo "FAIL stop-hook: $out"; exit 1 ;;
+esac
+
+# stop hook stays silent when the response is already Korean
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"이미 한국어로 된 응답입니다"}]}}' > "$tp"
+out=$(printf '{"transcript_path":"%s"}' "$tp" | KOEN_FAKE_TRANSLATION="X" "$bin" --stop-hook)
+[ -z "$out" ] || { echo "FAIL stop-hook korean skip: $out"; exit 1; }
+
 # KOEN_REPLY=en disables the suffix
 printf '한국어 입력\r' | KOEN_REPLY=en KOEN_HARNESS_CMD="$dir/child.sh" KOEN_FAKE_TRANSLATION="SWAPPED" "$bin" codex >/dev/null 2>&1 || true
 [ "$(cat "$cap")" = "SWAPPED" ] || { echo "FAIL KOEN_REPLY=en: $(cat "$cap")"; exit 1; }

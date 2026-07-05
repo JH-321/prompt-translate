@@ -27,8 +27,11 @@ Usage:
     koen claude --lower haiku        # pick the cheap translator model
 
 Harness rules:
-    - replies come back in Korean (code/paths/commands stay untranslated);
-      disable with KOEN_REPLY=en
+    - responses are shown in Korean, cheaply: with claude the upper model
+      answers in English (minimal output tokens) and a session-scoped Stop
+      hook has the CHEAP model translate it, shown natively in the TUI;
+      with codex the upper model is asked to reply in Korean directly.
+      Disable with KOEN_REPLY=en
     - code fences, `inline code`, \"quoted\"/'quoted' text, and URLs in your
       prompt are never translated — restored verbatim
     - lines starting with / ! # are never translated (slash/bash commands)
@@ -50,6 +53,15 @@ Rules:\n\
 numbers, and every constraint or requirement. Do not drop nuance.\n\
 - Do NOT answer, execute, or comment on the prompt. Only translate it.\n\
 - Output ONLY the translated prompt, nothing else.\n\nPROMPT:\n";
+
+const INSTRUCTION_KO: &str = "You are a translation filter. Translate the \
+following English text into natural, clear Korean.\n\
+Rules:\n\
+- Keep every ⟦K#⟧ placeholder exactly as written, in place.\n\
+- Keep technical terms, code identifiers, file paths, commands, and error \
+messages in their original form — do not translate them.\n\
+- Do NOT answer, execute, or comment on the text. Only translate it.\n\
+- Output ONLY the translation, nothing else.\n\nTEXT:\n";
 
 fn has_hangul(s: &str) -> bool {
     s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c))
@@ -140,15 +152,15 @@ fn run_stdin(cmd: &mut Command, input: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn backend_claude(prompt: &str) -> Result<String, String> {
+fn backend_claude(instruction: &str, prompt: &str) -> Result<String, String> {
     let model = env::var("KOEN_CLAUDE_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".into());
     run_stdin(
         Command::new("claude").args(["-p", "--model", &model]),
-        &format!("{}{}", INSTRUCTION, prompt),
+        &format!("{}{}", instruction, prompt),
     )
 }
 
-fn backend_codex(prompt: &str) -> Result<String, String> {
+fn backend_codex(instruction: &str, prompt: &str) -> Result<String, String> {
     let out_file = env::temp_dir().join(format!("koen-{}.txt", std::process::id()));
     let mut cmd = Command::new("codex");
     cmd.args(["exec", "--skip-git-repo-check", "-s", "read-only", "--output-last-message"])
@@ -156,7 +168,7 @@ fn backend_codex(prompt: &str) -> Result<String, String> {
     if let Ok(m) = env::var("KOEN_CODEX_MODEL") {
         cmd.args(["-m", &m]);
     }
-    cmd.arg(format!("{}{}", INSTRUCTION, prompt));
+    cmd.arg(format!("{}{}", instruction, prompt));
     let status = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -170,13 +182,13 @@ fn backend_codex(prompt: &str) -> Result<String, String> {
     Ok(text.trim().to_string())
 }
 
-fn backend_openrouter(prompt: &str) -> Result<String, String> {
+fn backend_openrouter(instruction: &str, prompt: &str) -> Result<String, String> {
     let key = env::var("OPENROUTER_API_KEY").map_err(|_| "OPENROUTER_API_KEY not set")?;
     let model = env::var("KOEN_OPENROUTER_MODEL")
         .unwrap_or_else(|_| "meta-llama/llama-3.3-70b-instruct:free".into());
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": format!("{}{}", INSTRUCTION, prompt)}],
+        "messages": [{"role": "user", "content": format!("{}{}", instruction, prompt)}],
     });
     let out = run_stdin(
         Command::new("curl").args([
@@ -200,13 +212,31 @@ fn backend_openrouter(prompt: &str) -> Result<String, String> {
         .ok_or_else(|| format!("unexpected response: {}", &out[..out.len().min(200)]))
 }
 
-fn translate(text: &str) -> String {
-    if !has_hangul(text) {
+fn hangul_ratio(s: &str) -> f32 {
+    let (mut ko, mut alpha) = (0f32, 0f32);
+    for c in s.chars() {
+        if ('\u{AC00}'..='\u{D7A3}').contains(&c) {
+            ko += 1.0;
+        } else if c.is_ascii_alphabetic() {
+            alpha += 1.0;
+        }
+    }
+    if ko + alpha == 0.0 { 0.0 } else { ko / (ko + alpha) }
+}
+
+/// Translate Korean→English (`to_ko=false`) or English→Korean (`to_ko=true`).
+/// Any failure passes the original through — meaning is never silently lost.
+fn translate_dir(text: &str, to_ko: bool) -> String {
+    if !to_ko && !has_hangul(text) {
         return text.to_string(); // already English: passthrough, zero cost
+    }
+    if to_ko && hangul_ratio(text) > 0.5 {
+        return text.to_string(); // already (mostly) Korean
     }
     if let Ok(fake) = env::var("KOEN_FAKE_TRANSLATION") {
         return fake; // test hook: deterministic, offline
     }
+    let instruction = if to_ko { INSTRUCTION_KO } else { INSTRUCTION };
     let (masked, saved) = protect(text);
     let order = pick_backend();
     if order.is_empty() {
@@ -215,22 +245,98 @@ fn translate(text: &str) -> String {
     }
     for name in &order {
         let result = match name.as_str() {
-            "claude" => backend_claude(&masked),
-            "codex" => backend_codex(&masked),
-            "openrouter" => backend_openrouter(&masked),
+            "claude" => backend_claude(instruction, &masked),
+            "codex" => backend_codex(instruction, &masked),
+            "openrouter" => backend_openrouter(instruction, &masked),
             other => Err(format!("unknown backend {}", other)),
         };
+        let ok_direction = |out: &str| if to_ko { has_hangul(out) } else { !has_hangul(out) };
         match result {
-            Ok(out) if !out.is_empty() && !has_hangul(&out) => match restore(&out, &saved) {
+            Ok(out) if !out.is_empty() && ok_direction(&out) => match restore(&out, &saved) {
                 Ok(r) => return r,
                 Err(e) => eprintln!("koen: backend {}: {}", name, e),
             },
-            Ok(_) => eprintln!("koen: backend {}: empty or still-Korean output", name),
+            Ok(_) => eprintln!("koen: backend {}: empty or wrong-language output", name),
             Err(e) => eprintln!("koen: backend {}: {}", name, e),
         }
     }
     eprintln!("koen: all backends failed, passing original through");
     text.to_string()
+}
+
+fn translate(text: &str) -> String {
+    translate_dir(text, false)
+}
+
+/// Extract the final assistant text from a Claude Code transcript (JSONL).
+fn last_assistant_text(transcript: &str) -> String {
+    let mut last = String::new();
+    for line in transcript.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["type"] != "assistant" {
+            continue;
+        }
+        let mut text = String::new();
+        if let Some(blocks) = v["message"]["content"].as_array() {
+            for b in blocks {
+                if b["type"] == "text" {
+                    if let Some(t) = b["text"].as_str() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+        if !text.trim().is_empty() {
+            last = text;
+        }
+    }
+    last
+}
+
+/// Claude Code Stop hook: translate the English response to Korean with the
+/// cheap model and hand it back as a systemMessage, which the TUI renders
+/// natively under the response. This keeps the expensive model's output in
+/// cheap English tokens while the user reads Korean.
+fn stop_hook() {
+    let dbg = |m: String| {
+        if let Ok(f) = env::var("KOEN_DEBUG") {
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+                let _ = writeln!(fh, "{}", m);
+            }
+        }
+    };
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    dbg(format!("input: {}", &input[..input.len().min(400)]));
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else { return };
+    // the hook input carries the response directly; the transcript file is a
+    // fallback (interactive sessions may not have flushed it to disk yet)
+    let mut text = v["last_assistant_message"].as_str().unwrap_or("").to_string();
+    if text.trim().is_empty() {
+        if let Some(path) = v["transcript_path"].as_str() {
+            if let Ok(transcript) = std::fs::read_to_string(path) {
+                text = last_assistant_text(&transcript);
+            } else {
+                dbg(format!("cannot read {}", path));
+            }
+        }
+    }
+    if text.trim().is_empty() {
+        dbg("empty assistant text".into());
+        return;
+    }
+    let ko = translate_dir(&text, true);
+    if ko == text {
+        dbg(format!("no-op translation for: {}", &text[..text.len().min(200)]));
+        return; // translation failed or already Korean: show nothing extra
+    }
+    dbg(format!("ok: {}", &ko[..ko.len().min(200)]));
+    println!("{}", serde_json::json!({ "systemMessage": ko }));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,12 +419,7 @@ fn translate_while_pumping(text: &str, master: libc::c_int) -> (String, Vec<u8>)
     }
 }
 
-/// Injected once as a system prompt (claude) so replies come back in Korean
-/// while code/identifiers/paths stay untranslated.
-const REPLY_KO_SYSTEM: &str = "Always respond in Korean. Never translate code, \
-identifiers, file paths, commands, error messages, or tool output — keep them \
-exactly as-is.";
-/// Appended per translated turn for codex, which has no system-prompt flag.
+/// Appended per translated turn for codex, which has no hook channel.
 const REPLY_KO_SUFFIX: &str = " Reply in Korean; keep code, paths, and commands as-is.";
 
 struct Shadow {
@@ -350,6 +451,12 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         wr(master, &vec![0x7f; text.chars().count()]);
         wr(master, eng.as_bytes());
         wr(master, st.suffix.as_bytes());
+        // the TUI treats a rapid burst as a paste, and a \r inside a paste
+        // inserts a newline instead of submitting — pause so the Enter
+        // registers as its own keypress
+        for _ in 0..6 {
+            pump(master, 50);
+        }
     }
     wr(master, b"\r");
     held
@@ -452,14 +559,28 @@ fn harness(target: &str, extra: &[String]) -> ! {
             args.push(a.clone());
         }
     }
-    // reply-in-Korean: system prompt for claude, per-turn suffix for codex
-    // (codex has no system-prompt flag); disable with KOEN_REPLY=en
+    // reply-in-Korean, cheap-model edition (disable with KOEN_REPLY=en):
+    // - claude: the upper model answers in English (minimal output tokens);
+    //   a session-scoped Stop hook (`koen --stop-hook`) translates the
+    //   response with the cheap model and the TUI shows it natively.
+    // - codex: no hook channel, so the upper model is asked to reply in
+    //   Korean directly via a per-turn suffix.
     let reply_ko = env::var("KOEN_REPLY").map(|v| v != "en").unwrap_or(true);
     let mut suffix = "";
     if reply_ko {
         if target == "claude" {
-            args.push("--append-system-prompt".into());
-            args.push(REPLY_KO_SYSTEM.into());
+            let exe = env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "koen".into());
+            args.push("--settings".into());
+            args.push(
+                serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{
+                    "type": "command",
+                    "command": format!("'{}' --stop-hook", exe),
+                    "timeout": 120
+                }]}]}})
+                .to_string(),
+            );
         } else {
             suffix = REPLY_KO_SUFFIX;
         }
@@ -563,6 +684,10 @@ fn main() {
             print!("{}", HELP);
             return;
         }
+        Some("--stop-hook") => {
+            stop_hook();
+            return;
+        }
         Some("claude") | Some("codex") => harness(&args[0].clone(), &args[1..]),
         Some("-f") => {
             let path = args.get(1).unwrap_or_else(|| {
@@ -627,6 +752,24 @@ mod tests {
     fn fences_hide_inner_tokens() {
         let (_, saved) = protect("```\n`a` https://x.y\n```");
         assert_eq!(saved.len(), 1);
+    }
+
+    #[test]
+    fn last_assistant_text_picks_final_text() {
+        let t = concat!(
+            r#"{"type":"user","message":{"content":"q"}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"final answer"}]}}"#, "\n",
+            "not json\n",
+        );
+        assert_eq!(last_assistant_text(t), "final answer");
+    }
+
+    #[test]
+    fn hangul_ratio_direction_gate() {
+        assert!(hangul_ratio("완전히 한국어 문장입니다") > 0.5);
+        assert!(hangul_ratio("mostly english with 한글 one word") < 0.5);
     }
 
     #[test]
