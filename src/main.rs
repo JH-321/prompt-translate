@@ -27,6 +27,10 @@ Usage:
     koen claude --lower haiku        # pick the cheap translator model
 
 Harness rules:
+    - replies come back in Korean (code/paths/commands stay untranslated);
+      disable with KOEN_REPLY=en
+    - code fences, `inline code`, \"quoted\"/'quoted' text, and URLs in your
+      prompt are never translated — restored verbatim
     - lines starting with / ! # are never translated (slash/bash commands)
     - lines edited with arrow keys / tab-complete pass through untranslated
     - translation failure -> the original line is submitted unchanged
@@ -55,10 +59,16 @@ fn placeholder(i: usize) -> String {
     format!("⟦K{}⟧", i)
 }
 
-/// Hide code fences, inline code, and URLs behind placeholders so the
-/// translator never touches them.
+/// Hide code fences, inline code, quoted text, and URLs behind placeholders
+/// so the translator never touches them.
 fn protect(text: &str) -> (String, Vec<String>) {
-    let patterns = [r"(?s)```.*?```", r"`[^`\n]+`", r"https?://\S+"];
+    let patterns = [
+        r"(?s)```.*?```",   // fenced code blocks
+        r"`[^`\n]+`",       // inline code
+        r#""[^"\n]+""#,     // "double-quoted" text: keep verbatim
+        r"'[^'\n]+'",       // 'single-quoted' text: keep verbatim
+        r"https?://\S+",    // URLs
+    ];
     let mut saved: Vec<String> = Vec::new();
     let mut out = text.to_string();
     for p in patterns {
@@ -303,11 +313,20 @@ fn translate_while_pumping(text: &str, master: libc::c_int) -> (String, Vec<u8>)
     }
 }
 
+/// Injected once as a system prompt (claude) so replies come back in Korean
+/// while code/identifiers/paths stay untranslated.
+const REPLY_KO_SYSTEM: &str = "Always respond in Korean. Never translate code, \
+identifiers, file paths, commands, error messages, or tool output — keep them \
+exactly as-is.";
+/// Appended per translated turn for codex, which has no system-prompt flag.
+const REPLY_KO_SUFFIX: &str = " Reply in Korean; keep code, paths, and commands as-is.";
+
 struct Shadow {
     buf: String,     // shadow of the TUI's current input line
     pend: Vec<u8>,   // bytes of a split utf-8 char
     dirty: bool,     // cursor moved / tab-completed: shadow unreliable, skip
     paste: bool,     // inside bracketed paste
+    suffix: &'static str, // appended after a swapped (translated) line
 }
 
 fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
@@ -330,6 +349,7 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         // grapheme/wide-char mismatch ever bites, count graphemes instead
         wr(master, &vec![0x7f; text.chars().count()]);
         wr(master, eng.as_bytes());
+        wr(master, st.suffix.as_bytes());
     }
     wr(master, b"\r");
     held
@@ -432,6 +452,18 @@ fn harness(target: &str, extra: &[String]) -> ! {
             args.push(a.clone());
         }
     }
+    // reply-in-Korean: system prompt for claude, per-turn suffix for codex
+    // (codex has no system-prompt flag); disable with KOEN_REPLY=en
+    let reply_ko = env::var("KOEN_REPLY").map(|v| v != "en").unwrap_or(true);
+    let mut suffix = "";
+    if reply_ko {
+        if target == "claude" {
+            args.push("--append-system-prompt".into());
+            args.push(REPLY_KO_SYSTEM.into());
+        } else {
+            suffix = REPLY_KO_SUFFIX;
+        }
+    }
     let mut cmd: Vec<String> = env::var("KOEN_HARNESS_CMD")
         .ok()
         .map(|v| v.split_whitespace().map(String::from).collect())
@@ -489,7 +521,7 @@ fn harness(target: &str, extra: &[String]) -> ! {
         }
     }
 
-    let mut st = Shadow { buf: String::new(), pend: Vec::new(), dirty: false, paste: false };
+    let mut st = Shadow { buf: String::new(), pend: Vec::new(), dirty: false, paste: false, suffix };
     loop {
         if !pump(master, 20) {
             break;
@@ -584,6 +616,14 @@ mod tests {
     }
 
     #[test]
+    fn quotes_protected() {
+        let src = r#"버튼 라벨을 "저장하기" 로, 메시지는 '완료됨' 으로 바꿔줘"#;
+        let (masked, saved) = protect(src);
+        assert!(!masked.contains("저장하기") && !masked.contains("완료됨"));
+        assert_eq!(restore(&masked, &saved).unwrap(), src);
+    }
+
+    #[test]
     fn fences_hide_inner_tokens() {
         let (_, saved) = protect("```\n`a` https://x.y\n```");
         assert_eq!(saved.len(), 1);
@@ -591,7 +631,7 @@ mod tests {
 
     #[test]
     fn shadow_utf8_split() {
-        let mut st = Shadow { buf: String::new(), pend: Vec::new(), dirty: false, paste: false };
+        let mut st = Shadow { buf: String::new(), pend: Vec::new(), dirty: false, paste: false, suffix: "" };
         let bytes = "안녕".as_bytes();
         feed_shadow(&mut st, &bytes[..2]); // split mid-char
         feed_shadow(&mut st, &bytes[2..]);
