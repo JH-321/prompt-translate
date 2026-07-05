@@ -20,11 +20,11 @@ Code 스킬입니다. 기계번역(Papago/Google Translate)과 달리 LLM 번역
 ```bash
 git clone https://github.com/JH-321/prompt-translate
 cd prompt-translate
-make install   # /usr/local/bin/koen + ~/.claude/skills/koen 심볼릭 링크
+make install   # cargo build 후 /usr/local/bin/koen + ~/.claude/skills/koen 링크
 ```
 
-요구사항: `python3` + 백엔드 하나 이상 (`claude` CLI / `codex` CLI /
-`OPENROUTER_API_KEY`). 의존성 설치 없음 — 표준 라이브러리만 사용.
+요구사항: Rust(`cargo`) + 백엔드 하나 이상 (`claude` CLI / `codex` CLI /
+`OPENROUTER_API_KEY`). 단일 정적 바이너리로 빌드됩니다.
 
 ## 사용법
 
