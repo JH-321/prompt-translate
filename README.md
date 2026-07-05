@@ -18,8 +18,8 @@ Code 하네스입니다. 기계번역(Papago/Google Translate)과 달리 LLM 번
 ## 설치
 
 ```bash
-git clone https://github.com/JH-321/prompt-translate
-cd prompt-translate
+git clone https://github.com/JH-321/prompt-koen
+cd prompt-koen
 make install   # cargo build 후 /usr/local/bin/koen 링크 + ~/.koenrc 생성
 ```
 
