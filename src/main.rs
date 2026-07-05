@@ -37,7 +37,8 @@ Harness rules:
     - code fences, `inline code`, \"quoted\"/'quoted' text, and URLs in your
       prompt are never translated — restored verbatim
     - lines starting with / ! # are never translated (slash/bash commands)
-    - lines edited with arrow keys / tab-complete pass through untranslated
+    - left/right/home/end + backspace edits are tracked, so a prompt fixed up
+      before Enter still gets translated; up/down and tab-complete skip it
     - translation failure -> the original line is submitted unchanged
 
 Backends (auto-detected, or force with KOEN_BACKEND=claude|codex|openrouter):
@@ -88,6 +89,16 @@ fn load_config() {
         }
         if (k.starts_with("KOEN_") || k.starts_with("OPENROUTER_")) && env::var(k).is_err() {
             env::set_var(k, v);
+        }
+    }
+}
+
+/// Append a line to $KOEN_DEBUG if set. Used to diagnose the harness live:
+/// what the shadow captured, why a line was (not) swapped.
+fn dbg_log(msg: &str) {
+    if let Ok(f) = env::var("KOEN_DEBUG") {
+        if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(fh, "{}", msg);
         }
     }
 }
@@ -346,13 +357,7 @@ fn prompt_hook() {
 /// natively under the response. This keeps the expensive model's output in
 /// cheap English tokens while the user reads Korean.
 fn stop_hook() {
-    let dbg = |m: String| {
-        if let Ok(f) = env::var("KOEN_DEBUG") {
-            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
-                let _ = writeln!(fh, "{}", m);
-            }
-        }
-    };
+    let dbg = |m: String| dbg_log(&m);
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return;
@@ -468,16 +473,20 @@ fn translate_while_pumping(text: &str, master: libc::c_int) -> (String, Vec<u8>)
 const REPLY_KO_SUFFIX: &str = " Reply in Korean; keep code, paths, and commands as-is.";
 
 struct Shadow {
-    buf: String,     // shadow of the TUI's current input line
+    buf: Vec<char>,  // shadow of the TUI's current input line
+    cursor: usize,   // insert position within buf (chars from start)
     pend: Vec<u8>,   // bytes of a split utf-8 char
-    dirty: bool,     // cursor moved / tab-completed: shadow unreliable, skip
+    dirty: bool,     // up/down/tab-complete: shadow unreliable, skip
     paste: bool,     // inside bracketed paste
     suffix: &'static str, // appended after a swapped (translated) line
 }
 
 fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
-    let text = mem::take(&mut st.buf);
+    let cursor = st.cursor;
+    let buf = mem::take(&mut st.buf);
+    st.cursor = 0;
     st.pend.clear();
+    let text: String = buf.iter().collect();
     let was_dirty = mem::replace(&mut st.dirty, false);
     let head = text.trim_start();
     let skip = was_dirty
@@ -485,18 +494,31 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         || head.starts_with('/')
         || head.starts_with('!')
         || head.starts_with('#');
+    dbg_log(&format!(
+        "on_enter: dirty={} hangul={} skip={} chars={} line={:?}",
+        was_dirty, has_hangul(&text), skip, text.chars().count(),
+        &text[..text.len().min(200)]
+    ));
     if skip {
         wr(master, b"\r");
         return Vec::new();
     }
     let (eng, held) = translate_while_pumping(&text, master);
+    dbg_log(&format!(
+        "on_enter: translated -> swapped={} out={:?}",
+        eng != text && !has_hangul(&eng), &eng[..eng.len().min(200)]
+    ));
     if eng != text && !has_hangul(&eng) {
         if let Ok(p) = env::var("KOEN_ORIG_FILE") {
             let _ = std::fs::write(p, &text); // shown by the UserPromptSubmit hook
         }
-        // ponytail: one backspace per char erases the input box; if a
-        // grapheme/wide-char mismatch ever bites, count graphemes instead
-        wr(master, &vec![0x7f; text.chars().count()]);
+        // the user may have left the cursor mid-line (arrow-key edit): move
+        // claude's cursor to the end first, then one backspace per char clears
+        // the whole box. ponytail: if a wide-char mismatch ever bites, count
+        // graphemes instead of chars.
+        let len = buf.len();
+        wr(master, "\x1b[C".repeat(len - cursor).as_bytes());
+        wr(master, &vec![0x7f; len]);
         wr(master, eng.as_bytes());
         wr(master, st.suffix.as_bytes());
         // the TUI treats a rapid burst as a paste, and a \r inside a paste
@@ -515,20 +537,26 @@ fn feed_shadow(st: &mut Shadow, chunk: &[u8]) {
         st.dirty = true; // tab-complete or other control key
     }
     st.pend.extend(chunk.iter().filter(|&&c| c >= 0x20));
-    match std::str::from_utf8(&st.pend) {
+    let decoded = match std::str::from_utf8(&st.pend) {
         Ok(s) => {
-            st.buf.push_str(s);
+            let s = s.to_string();
             st.pend.clear();
+            s
         }
         Err(e) => {
             let valid = e.valid_up_to();
-            st.buf.push_str(std::str::from_utf8(&st.pend[..valid]).unwrap());
+            let s = std::str::from_utf8(&st.pend[..valid]).unwrap().to_string();
             st.pend.drain(..valid);
             if e.error_len().is_some() || st.pend.len() > 8 {
                 st.pend.clear(); // garbage, not a split utf-8 char
                 st.dirty = true;
             }
+            s
         }
+    };
+    for ch in decoded.chars() {
+        st.buf.insert(st.cursor, ch); // insert at cursor, not always the end
+        st.cursor += 1;
     }
 }
 
@@ -553,7 +581,30 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
             match seq {
                 b"\x1b[200~" => st.paste = true,
                 b"\x1b[201~" => st.paste = false,
-                _ => st.dirty = true, // arrows etc: shadow no longer trustworthy
+                // Cursor moves / edits within the line: track them so a prompt
+                // fixed up with arrow keys still gets translated. Left/Right,
+                // Home/End, and Delete keep the shadow in sync with the box.
+                b"\x1b[C" => st.cursor = (st.cursor + 1).min(st.buf.len()), // Right
+                b"\x1b[D" => st.cursor = st.cursor.saturating_sub(1),       // Left
+                b"\x1b[H" | b"\x1b[1~" => st.cursor = 0,                    // Home
+                b"\x1b[F" | b"\x1b[4~" => st.cursor = st.buf.len(),         // End
+                b"\x1b[3~" => {                                             // Delete
+                    if st.cursor < st.buf.len() {
+                        st.buf.remove(st.cursor);
+                    }
+                }
+                // option/shift+Enter soft newline: a real newline in the
+                // prompt, not a cursor move.
+                // ponytail: covers ESC-CR/ESC-LF (macOS Meta+Return). Terminals
+                // that send \x1b[13;2u etc. fall through to dirty — safe, just
+                // submits that prompt untranslated.
+                b"\x1b\r" | b"\x1b\n" => {
+                    st.buf.insert(st.cursor, '\n');
+                    st.cursor += 1;
+                }
+                // up/down (history or wrapped-line moves), fn keys, unknown:
+                // the shadow can no longer be trusted, so skip translation
+                _ => st.dirty = true,
             }
             wr(master, seq);
             i = end + 1;
@@ -566,16 +617,22 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
             }
             i += 1;
         } else if (b == 0x0d || b == 0x0a) && st.paste {
-            st.buf.push('\n'); // newline inside pasted text: part of the input
+            // newline inside pasted text: part of the input
+            st.buf.insert(st.cursor, '\n');
+            st.cursor += 1;
             wr(master, &q[i..=i]);
             i += 1;
         } else if b == 0x7f {
-            st.buf.pop();
+            if st.cursor > 0 {
+                st.buf.remove(st.cursor - 1); // delete the char before the cursor
+                st.cursor -= 1;
+            }
             wr(master, &q[i..=i]);
             i += 1;
         } else if b == 0x03 || b == 0x15 {
             // ctrl-c / ctrl-u clear the input line
             st.buf.clear();
+            st.cursor = 0;
             st.pend.clear();
             st.dirty = false;
             wr(master, &q[i..=i]);
@@ -717,7 +774,7 @@ fn harness(target: &str, extra: &[String]) -> ! {
         }
     }
 
-    let mut st = Shadow { buf: String::new(), pend: Vec::new(), dirty: false, paste: false, suffix };
+    let mut st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, suffix };
     loop {
         if !pump(master, 20) {
             break;
@@ -855,13 +912,51 @@ mod tests {
         assert!(hangul_ratio("mostly english with 한글 one word") < 0.5);
     }
 
+    fn test_shadow() -> (Shadow, libc::c_int) {
+        use std::os::unix::io::IntoRawFd;
+        let fd = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap().into_raw_fd();
+        let st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, suffix: "" };
+        (st, fd)
+    }
+    fn shadow_text(st: &Shadow) -> String {
+        st.buf.iter().collect()
+    }
+
+    #[test]
+    fn soft_newline_keeps_shadow_translatable() {
+        // option/shift+Enter (ESC-CR) must be a newline in the shadow, not a
+        // dirty marker — else a multi-line Korean prompt submits untranslated.
+        let (mut st, fd) = test_shadow();
+        process_input(&mut st, "첫째\x1b\r둘째".as_bytes(), fd);
+        assert_eq!(shadow_text(&st), "첫째\n둘째");
+        assert!(!st.dirty, "soft newline must not mark the shadow dirty");
+    }
+
+    #[test]
+    fn arrow_edit_tracks_cursor_not_dirty() {
+        // the real bug: fixing a typo with arrow keys must NOT skip translation.
+        let (mut st, fd) = test_shadow();
+        process_input(&mut st, "가나".as_bytes(), fd); // buf="가나" cursor=2
+        process_input(&mut st, "\x1b[D".as_bytes(), fd); // Left -> cursor=1
+        process_input(&mut st, "다".as_bytes(), fd); // insert mid-line
+        assert_eq!(shadow_text(&st), "가다나");
+        assert!(!st.dirty, "left-arrow edit must stay translatable");
+        process_input(&mut st, "\x1b[3~".as_bytes(), fd); // Delete at cursor=2 -> removes 나
+        assert_eq!(shadow_text(&st), "가다");
+        process_input(&mut st, "\x7f".as_bytes(), fd); // Backspace -> removes 다
+        assert_eq!(shadow_text(&st), "가");
+        assert!(!st.dirty);
+        process_input(&mut st, "\x1b[A".as_bytes(), fd); // Up arrow: genuinely ambiguous
+        assert!(st.dirty);
+    }
+
     #[test]
     fn shadow_utf8_split() {
-        let mut st = Shadow { buf: String::new(), pend: Vec::new(), dirty: false, paste: false, suffix: "" };
+        let (mut st, _) = test_shadow();
         let bytes = "안녕".as_bytes();
         feed_shadow(&mut st, &bytes[..2]); // split mid-char
         feed_shadow(&mut st, &bytes[2..]);
-        assert_eq!(st.buf, "안녕");
+        assert_eq!(shadow_text(&st), "안녕");
         assert!(!st.dirty);
     }
 }
