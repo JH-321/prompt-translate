@@ -181,6 +181,34 @@ fn pick_backend() -> Vec<String> {
     order
 }
 
+fn timeout_secs() -> u64 {
+    env::var("KOEN_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+}
+
+/// Kills the child by pid if it outlives `secs`; cancelled on drop so a child
+/// that finishes in time is never touched. Guards against a hung `claude -p` /
+/// `codex exec` freezing the whole harness after Enter.
+struct Watchdog(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+fn watchdog(pid: u32, secs: u64) -> Watchdog {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f = flag.clone();
+    thread::spawn(move || {
+        for _ in 0..secs * 10 {
+            thread::sleep(std::time::Duration::from_millis(100));
+            if f.load(std::sync::atomic::Ordering::Relaxed) {
+                return; // child already finished
+            }
+        }
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    });
+    Watchdog(flag)
+}
+
 fn run_stdin(cmd: &mut Command, input: &str) -> Result<String, String> {
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -194,6 +222,7 @@ fn run_stdin(cmd: &mut Command, input: &str) -> Result<String, String> {
         .unwrap()
         .write_all(input.as_bytes())
         .map_err(|e| e.to_string())?;
+    let _guard = watchdog(child.id(), timeout_secs());
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -219,11 +248,13 @@ fn backend_codex(instruction: &str, prompt: &str) -> Result<String, String> {
         cmd.args(["-m", &m]);
     }
     cmd.arg(format!("{}{}", instruction, prompt));
-    let status = cmd
+    let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| e.to_string())?;
+    let _guard = watchdog(child.id(), timeout_secs());
+    let status = child.wait().map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(&out_file);
     let _ = std::fs::remove_file(&out_file); // clean up on failure paths too
     if !status.success() {
@@ -665,7 +696,10 @@ impl Screen {
                 off += 1;
             }
         }
-        Some((text, off))
+        // the cursor may sit past the trimmed text (in trailing space); clamp so
+        // callers can compute (len - off) without underflowing
+        let n = text.chars().count();
+        Some((text, off.min(n)))
     }
 }
 
@@ -693,7 +727,36 @@ fn screen_input_empty(baseline: &[char]) -> bool {
     screen_read_input(baseline).is_none()
 }
 
+/// Kill the whole input line (Ctrl-U) and confirm via the screen that it
+/// emptied. Chip- and wrap-agnostic. Returns false — leaving the box untouched
+/// — when there's no reliable baseline or the box refused to clear, so the
+/// caller submits the line as-is rather than mangling it.
+fn clear_via_kill(baseline: &[char], master: libc::c_int) -> bool {
+    if !baseline.iter().any(|&c| c != ' ' && c != CONT) {
+        return false;
+    }
+    for _ in 0..3 {
+        wr(master, &[0x15]); // Ctrl-U
+        for _ in 0..4 {
+            pump(master, 15); // let claude redraw before checking
+        }
+        if screen_input_empty(baseline) {
+            return true;
+        }
+    }
+    false
+}
+
 static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Restores the terminal to `old` (cooked) mode on drop — the safety net if the
+/// harness unwinds on a panic instead of reaching its explicit restore.
+struct TermiosGuard(libc::termios);
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &self.0) };
+    }
+}
 
 extern "C" fn on_winch(_: libc::c_int) {
     let master = MASTER_FD.load(std::sync::atomic::Ordering::Relaxed);
@@ -722,7 +785,10 @@ fn wr(fd: libc::c_int, mut buf: &[u8]) {
 /// poll a single fd for readability; returns true if readable
 fn readable(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
     let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    unsafe { libc::poll(&mut p, 1, timeout_ms) > 0 && p.revents & (libc::POLLIN | libc::POLLHUP) != 0 }
+    // include POLLERR/POLLNVAL: a broken master must count as "go read" so the
+    // read returns EOF and the loop exits, instead of spinning forever.
+    let mask = libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    unsafe { libc::poll(&mut p, 1, timeout_ms) > 0 && p.revents & mask != 0 }
 }
 
 /// Forward pending child output to our stdout. False on child EOF.
@@ -761,6 +827,11 @@ fn translate_while_pumping(text: &str, master: libc::c_int) -> (String, Vec<u8>)
             let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n > 0 {
                 held.extend_from_slice(&buf[..n as usize]);
+                // raw mode swallows Ctrl-C into `held`; treat it as "abort the
+                // translation" so a slow/stuck cheap model can't wedge the TUI
+                if held.contains(&0x03) {
+                    return (text.to_string(), held);
+                }
             }
         }
     }
@@ -841,6 +912,12 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         return Vec::new();
     }
     let (eng, held) = translate_while_pumping(&text, master);
+    // Ctrl-C during translation: don't swap, don't submit — hand the keys back
+    // (the 0x03 reaches claude and clears its box). A clean abort.
+    if held.contains(&0x03) {
+        dbg_log("on_enter: aborted by Ctrl-C during translation");
+        return held;
+    }
     dbg_log(&format!(
         "on_enter: translated -> swapped={} out={:?}",
         eng != text && !has_hangul(&eng), clip(&eng, 200)
@@ -851,31 +928,18 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         // ours, so backspacing our count would be wrong — kill the line and
         // verify it actually emptied; only swap when it did. Verified on claude
         // 2.1.201: Ctrl-U clears both typed text and the [Pasted text] chip.
-        let cleared = if paste_seen {
-            // Without a reliable empty-prompt baseline we can't confirm a clear,
-            // so don't risk killing the line and submitting an empty prompt —
-            // leave the paste untouched.
-            if st.baseline.iter().any(|&c| c != ' ' && c != CONT) {
-                let mut ok = false;
-                for _ in 0..3 {
-                    wr(master, &[0x15]); // Ctrl-U: kill the whole input line
-                    for _ in 0..4 {
-                        pump(master, 15); // let claude redraw before checking
-                    }
-                    if screen_input_empty(&st.baseline) {
-                        ok = true;
-                        break;
-                    }
-                }
-                ok
-            } else {
-                false
-            }
+        let cleared = if paste_seen || was_dirty {
+            // Screen-derived text (paste chip, or an up/down recall that may wrap
+            // across rows): our char count / cursor can't be trusted against the
+            // box, so kill the whole line (Ctrl-U) and verify it emptied. Needs a
+            // reliable empty-prompt baseline; without one, don't risk submitting
+            // an empty prompt — leave the line untouched.
+            clear_via_kill(&st.baseline, master)
         } else {
-            // ordinary line: move a possibly mid-line cursor to the end, then
-            // one backspace per char clears it exactly. ponytail: if a wide-char
-            // mismatch ever bites, count graphemes instead of chars.
-            wr(master, "\x1b[C".repeat(total - cur_off).as_bytes());
+            // exact shadow: move a possibly mid-line cursor to the end, then one
+            // backspace per char clears it. ponytail: if a wide-char mismatch
+            // ever bites, count graphemes instead of chars.
+            wr(master, "\x1b[C".repeat(total.saturating_sub(cur_off)).as_bytes());
             wr(master, &vec![0x7f; total]);
             true
         };
@@ -1149,6 +1213,10 @@ fn harness(target: &str, extra: &[String]) -> ! {
             libc::tcsetattr(0, libc::TCSADRAIN, &raw);
         }
     }
+    // Restore cooked mode if the harness ever panics — a terminal left in raw
+    // mode is unusable. On the normal path we exit via process::exit (skips
+    // Drop) after the explicit tcsetattr below, so this only fires on unwind.
+    let _term_guard = interactive.then_some(TermiosGuard(old));
 
     let mut st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, paste_seen: false, baseline: Vec::new(), suffix };
     loop {
@@ -1446,8 +1514,11 @@ mod tests {
         }
         unsafe { libc::close(rd) };
         let sent = String::from_utf8_lossy(&out);
-        assert!(sent.contains("FIX THE BUG"), "must type the translation: {:?}", sent);
-        assert!(sent.contains('\x7f'), "must erase the recalled line first: {:?}", sent);
+        // The static in-process screen can't clear in response to Ctrl-U (there's
+        // no live claude to redraw), so on_enter reads the recalled Korean,
+        // translates it, and *attempts* the kill-line clear — proven here by the
+        // Ctrl-U it emits. The full clear→retype is covered by the mock e2e runs.
+        assert!(sent.contains('\u{15}'), "must attempt kill-line clear (Ctrl-U): {:?}", sent);
         *SCREEN.lock().unwrap() = None;
         std::env::remove_var("KOEN_FAKE_TRANSLATION");
     }
