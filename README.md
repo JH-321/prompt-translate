@@ -95,7 +95,7 @@ Rules of the road:
 | Korean line + Enter | translate → erase → submit English (original echoed below) |
 | English line | passes through untouched — zero cost |
 | Line starting with `/` `!` `#` | never translated: skill names & command args stay intact |
-| Line edited with arrows / tab-complete | passes through untranslated (shadow buffer can't be trusted) |
+| Line edited with arrows, or recalled with up/down history | still translated — koen reads the real input box off an emulated screen |
 | Code fences, `` `inline` ``, `"quotes"`, `'quotes'`, URLs | never sent to the translator, restored verbatim |
 | Translation failure | original line submitted — the session never breaks |
 

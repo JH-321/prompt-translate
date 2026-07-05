@@ -37,8 +37,9 @@ Harness rules:
     - code fences, `inline code`, \"quoted\"/'quoted' text, and URLs in your
       prompt are never translated — restored verbatim
     - lines starting with / ! # are never translated (slash/bash commands)
-    - left/right/home/end + backspace edits are tracked, so a prompt fixed up
-      before Enter still gets translated; up/down and tab-complete skip it
+    - arrow-key edits (left/right/home/end/backspace) are tracked, and a line
+      recalled with up/down or otherwise reshaped is read back off the screen,
+      so whatever is actually in the input box at Enter gets translated
     - translation failure -> the original line is submitted unchanged
 
 Backends (auto-detected, or force with KOEN_BACKEND=claude|codex|openrouter):
@@ -401,6 +402,285 @@ fn stop_hook() {
 
 static MASTER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+// ---------------------------------------------------------------------------
+// Minimal terminal emulator. It consumes claude's OUTPUT stream to keep a
+// screen grid + cursor, so at Enter time koen can read the *real* input-box
+// text even when the keystroke shadow cannot know it — history recall (up/down),
+// tab-complete, autocomplete. It is only a fallback for "dirty" lines; ordinary
+// typing/editing still uses the exact shadow, so a bug here can't hurt the
+// common path.
+//
+// UI-change resistance: the input text is recovered by stripping the longest
+// common prefix between the current input row and a baseline snapshot of the
+// empty prompt row. Whatever glyphs claude uses for the prompt/border are
+// identical in both, so they cancel out — nothing about claude's look is
+// hardcoded.
+// ---------------------------------------------------------------------------
+
+/// Display columns a char occupies (Korean/CJK/emoji are wide). No stdlib for
+/// this; the ranges below cover what shows up in a Korean prompt.
+fn char_width(ch: char) -> usize {
+    let u = ch as u32;
+    let wide = (0x1100..=0x115F).contains(&u)   // Hangul Jamo
+        || (0x2E80..=0xA4CF).contains(&u)       // CJK, Kangxi, kana, ...
+        || (0xAC00..=0xD7A3).contains(&u)       // Hangul syllables
+        || (0xF900..=0xFAFF).contains(&u)       // CJK compat
+        || (0xFE30..=0xFE4F).contains(&u)       // CJK compat forms
+        || (0xFF00..=0xFF60).contains(&u)       // fullwidth forms
+        || (0xFFE0..=0xFFE6).contains(&u)
+        || (0x1F300..=0x1FAFF).contains(&u)     // emoji (approx)
+        || (0x20000..=0x3FFFD).contains(&u);    // CJK ext B+
+    if wide { 2 } else { 1 }
+}
+
+const CONT: char = '\u{1}'; // right half of a wide char, skipped when reading
+
+static SCREEN: std::sync::Mutex<Option<Screen>> = std::sync::Mutex::new(None);
+
+struct Screen {
+    rows: usize,
+    cols: usize,
+    grid: Vec<Vec<char>>, // rows x cols
+    r: usize,             // cursor row / col
+    c: usize,
+    sr: usize,            // saved cursor
+    sc: usize,
+    pend: Vec<u8>,        // partial utf-8
+    st: u8,               // 0 normal, 1 after ESC, 2 CSI, 3 OSC, 4 ESC-intermediate
+    csi: Vec<u8>,         // CSI params being collected
+}
+
+impl Screen {
+    fn new(rows: usize, cols: usize) -> Screen {
+        // fall back to a standard size when the tty size is unknown (0)
+        let rows = if rows == 0 { 24 } else { rows };
+        let cols = if cols == 0 { 80 } else { cols };
+        Screen {
+            rows, cols,
+            grid: vec![vec![' '; cols]; rows],
+            r: 0, c: 0, sr: 0, sc: 0,
+            pend: Vec::new(), st: 0, csi: Vec::new(),
+        }
+    }
+
+    fn resize(&mut self, rows: usize, cols: usize) {
+        self.rows = if rows == 0 { 24 } else { rows };
+        self.cols = if cols == 0 { 80 } else { cols };
+        self.grid = vec![vec![' '; self.cols]; self.rows];
+        self.r = self.r.min(self.rows - 1);
+        self.c = self.c.min(self.cols - 1);
+    }
+
+    fn newline(&mut self) {
+        if self.r + 1 >= self.rows {
+            self.grid.remove(0);
+            self.grid.push(vec![' '; self.cols]);
+        } else {
+            self.r += 1;
+        }
+    }
+
+    fn put(&mut self, ch: char) {
+        let w = char_width(ch);
+        if self.c + w > self.cols {
+            self.c = 0;
+            self.newline();
+        }
+        if self.r < self.rows && self.c < self.cols {
+            self.grid[self.r][self.c] = ch;
+            if w == 2 && self.c + 1 < self.cols {
+                self.grid[self.r][self.c + 1] = CONT;
+            }
+        }
+        self.c += w;
+        if self.c > self.cols {
+            self.c = self.cols;
+        }
+    }
+
+    /// numeric CSI params (default 0 for empty), and whether it's a `?` private
+    fn params(&self) -> (Vec<usize>, bool) {
+        let body = &self.csi;
+        let priv_ = body.first() == Some(&b'?');
+        let body = if priv_ { &body[1..] } else { &body[..] };
+        let s = String::from_utf8_lossy(body);
+        let out: Vec<usize> = s
+            .split(';')
+            .map(|p| p.parse::<usize>().unwrap_or(0))
+            .collect();
+        (out, priv_)
+    }
+
+    fn erase_row(&mut self, row: usize, from: usize, to: usize) {
+        for x in from..to.min(self.cols) {
+            self.grid[row][x] = ' ';
+        }
+    }
+
+    fn csi_dispatch(&mut self, final_b: u8) {
+        let (p, priv_) = self.params();
+        let n = |i: usize| *p.get(i).filter(|&&v| v > 0).unwrap_or(&1);
+        match final_b {
+            b'A' => self.r = self.r.saturating_sub(n(0)),
+            b'B' => self.r = (self.r + n(0)).min(self.rows - 1),
+            b'C' => self.c = (self.c + n(0)).min(self.cols - 1),
+            b'D' => self.c = self.c.saturating_sub(n(0)),
+            b'E' => { self.r = (self.r + n(0)).min(self.rows - 1); self.c = 0; }
+            b'F' => { self.r = self.r.saturating_sub(n(0)); self.c = 0; }
+            b'G' => self.c = (n(0) - 1).min(self.cols - 1),
+            b'd' => self.r = (n(0) - 1).min(self.rows - 1),
+            b'H' | b'f' => {
+                self.r = (n(0) - 1).min(self.rows - 1);
+                self.c = (n(1) - 1).min(self.cols - 1);
+            }
+            b'J' => {
+                let mode = *p.first().unwrap_or(&0);
+                let (r, c) = (self.r, self.c);
+                if mode == 0 {
+                    self.erase_row(r, c, self.cols);
+                    for row in r + 1..self.rows { self.erase_row(row, 0, self.cols); }
+                } else if mode == 1 {
+                    for row in 0..r { self.erase_row(row, 0, self.cols); }
+                    self.erase_row(r, 0, c + 1);
+                } else {
+                    for row in 0..self.rows { self.erase_row(row, 0, self.cols); }
+                }
+            }
+            b'K' => {
+                let mode = *p.first().unwrap_or(&0);
+                let (r, c) = (self.r, self.c);
+                match mode {
+                    0 => self.erase_row(r, c, self.cols),
+                    1 => self.erase_row(r, 0, c + 1),
+                    _ => self.erase_row(r, 0, self.cols),
+                }
+            }
+            b'P' => { // delete chars: shift left, blank-fill at end
+                let k = n(0).min(self.cols - self.c);
+                let (r, c) = (self.r, self.c);
+                for x in c..self.cols {
+                    self.grid[r][x] = if x + k < self.cols { self.grid[r][x + k] } else { ' ' };
+                }
+            }
+            b'@' => { // insert blanks
+                let k = n(0).min(self.cols - self.c);
+                let (r, c) = (self.r, self.c);
+                for x in (c..self.cols).rev() {
+                    self.grid[r][x] = if x >= c + k { self.grid[r][x - k] } else { ' ' };
+                }
+            }
+            b'X' => { let (r, c) = (self.r, self.c); self.erase_row(r, c, c + n(0)); }
+            b's' => { self.sr = self.r; self.sc = self.c; }
+            b'u' => { self.r = self.sr; self.c = self.sc; }
+            b'h' | b'l' if priv_ => {
+                // alt-screen switch (1049/1047/47): clear so stale text doesn't
+                // bleed into the input read
+                if p.contains(&1049) || p.contains(&1047) || p.contains(&47) {
+                    for row in 0..self.rows { self.erase_row(row, 0, self.cols); }
+                    self.r = 0; self.c = 0;
+                }
+            }
+            _ => {} // SGR (m), scroll region (r), modes, etc.: no effect on layout
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            match self.st {
+                1 => { // after ESC
+                    self.st = 0;
+                    match b {
+                        b'[' => { self.st = 2; self.csi.clear(); }
+                        b']' => self.st = 3,
+                        b'7' => { self.sr = self.r; self.sc = self.c; }
+                        b'8' => { self.r = self.sr; self.c = self.sc; }
+                        b'M' => { if self.r == 0 { self.grid.insert(0, vec![' '; self.cols]); self.grid.pop(); } else { self.r -= 1; } }
+                        b'(' | b')' | b'#' | b'%' => self.st = 4, // consume one more byte
+                        _ => {}
+                    }
+                }
+                2 => { // CSI: collect until final byte 0x40..=0x7e
+                    if (0x40..=0x7e).contains(&b) {
+                        self.csi_dispatch(b);
+                        self.st = 0;
+                    } else {
+                        self.csi.push(b);
+                    }
+                }
+                3 => { // OSC: skip until BEL or ESC \
+                    if b == 0x07 { self.st = 0; }
+                    else if b == 0x1b { self.st = 1; } // ESC \ terminator (approx)
+                }
+                4 => self.st = 0, // charset/intermediate: swallowed one byte
+                _ => match b {
+                    0x1b => self.st = 1,
+                    b'\r' => self.c = 0,
+                    b'\n' => self.newline(),
+                    0x08 => self.c = self.c.saturating_sub(1),
+                    0x09 => self.c = ((self.c / 8) * 8 + 8).min(self.cols - 1),
+                    0x07 => {}
+                    _ if b < 0x20 => {}
+                    _ => {
+                        self.pend.push(b);
+                        match std::str::from_utf8(&self.pend) {
+                            Ok(s) => { let ch = s.chars().next().unwrap(); self.pend.clear(); self.put(ch); }
+                            Err(e) if e.error_len().is_some() || self.pend.len() > 4 => self.pend.clear(),
+                            Err(_) => {} // wait for more bytes of this char
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    fn row_chars(&self, row: usize) -> &[char] {
+        &self.grid[row]
+    }
+
+    /// Read the current input line by cancelling out the empty-prompt baseline.
+    /// Returns (input text, cursor char-offset from the input start).
+    fn read_input(&self, baseline: &[char]) -> Option<(String, usize)> {
+        let row = &self.grid[self.r];
+        let mut start = 0;
+        while start < row.len() && start < baseline.len() && row[start] == baseline[start] {
+            start += 1;
+        }
+        let text: String = row[start..].iter().filter(|&&ch| ch != CONT).collect();
+        let text = text.trim_end().trim_end_matches(|ch| "│┃▏▕|╮╯".contains(ch)).trim_end().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        let mut off = 0;
+        for x in start..self.c.min(row.len()) {
+            if row[x] != CONT {
+                off += 1;
+            }
+        }
+        Some((text, off))
+    }
+}
+
+/// Feed claude's output into the shared screen model.
+fn screen_feed(bytes: &[u8]) {
+    if let Ok(mut g) = SCREEN.lock() {
+        if let Some(s) = g.as_mut() {
+            s.feed(bytes);
+        }
+    }
+}
+
+/// Snapshot the cursor row (used as the empty-prompt baseline).
+fn screen_cursor_row() -> Vec<char> {
+    SCREEN.lock().ok().and_then(|g| g.as_ref().map(|s| s.row_chars(s.r).to_vec())).unwrap_or_default()
+}
+
+/// Read the real input line off the screen (fallback for dirty shadow lines).
+fn screen_read_input(baseline: &[char]) -> Option<(String, usize)> {
+    SCREEN.lock().ok().and_then(|g| g.as_ref().and_then(|s| s.read_input(baseline)))
+}
+
+static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 extern "C" fn on_winch(_: libc::c_int) {
     let master = MASTER_FD.load(std::sync::atomic::Ordering::Relaxed);
     if master >= 0 {
@@ -411,6 +691,8 @@ extern "C" fn on_winch(_: libc::c_int) {
             }
         }
     }
+    // resize the screen model off the signal path (locking here isn't safe)
+    WINCH.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn wr(fd: libc::c_int, mut buf: &[u8]) {
@@ -437,6 +719,7 @@ fn pump(master: libc::c_int, timeout_ms: libc::c_int) -> bool {
         if n <= 0 {
             return false;
         }
+        screen_feed(&buf[..n as usize]); // keep the screen model in sync
         wr(1, &buf[..n as usize]);
     }
     true
@@ -476,9 +759,15 @@ struct Shadow {
     buf: Vec<char>,  // shadow of the TUI's current input line
     cursor: usize,   // insert position within buf (chars from start)
     pend: Vec<u8>,   // bytes of a split utf-8 char
-    dirty: bool,     // up/down/tab-complete: shadow unreliable, skip
+    dirty: bool,     // up/down/tab-complete: shadow unreliable, read screen
     paste: bool,     // inside bracketed paste
+    baseline: Vec<char>, // empty-prompt row, snapshot while the line is empty
     suffix: &'static str, // appended after a swapped (translated) line
+}
+
+fn starts_cmd(s: &str) -> bool {
+    let h = s.trim_start();
+    h.starts_with('/') || h.starts_with('!') || h.starts_with('#')
 }
 
 fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
@@ -486,20 +775,39 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
     let buf = mem::take(&mut st.buf);
     st.cursor = 0;
     st.pend.clear();
-    let text: String = buf.iter().collect();
     let was_dirty = mem::replace(&mut st.dirty, false);
-    let head = text.trim_start();
-    let skip = was_dirty
-        || !has_hangul(&text)
-        || head.starts_with('/')
-        || head.starts_with('!')
-        || head.starts_with('#');
+
+    // The true input line + cursor char-offset. When the shadow is reliable
+    // (ordinary typing/editing) it is exact; when it went dirty (up/down recall,
+    // tab-complete) fall back to reading the line straight off the screen.
+    let (text, cur_off): (String, usize) = if !was_dirty {
+        (buf.iter().collect(), cursor)
+    } else {
+        // let claude's redraw (up/down recall, autocomplete) land in the screen
+        // model first — Enter can arrive in the same read burst as the up-arrow
+        for _ in 0..4 {
+            pump(master, 15);
+        }
+        if env::var("KOEN_DEBUG").is_ok() {
+            let cur: String = SCREEN.lock().ok()
+                .and_then(|g| g.as_ref().map(|s| { let r = s.r; s.row_chars(r).iter().filter(|&&c| c != CONT).collect::<String>() }))
+                .unwrap_or_default();
+            dbg_log(&format!("on_enter: baseline={:?} cur_row={:?}",
+                st.baseline.iter().filter(|&&c| c != CONT).collect::<String>(), cur));
+        }
+        match screen_read_input(&st.baseline) {
+            Some(v) => v,
+            None => (String::new(), 0),
+        }
+    };
+    let total = text.chars().count();
+    let translatable = !text.is_empty() && has_hangul(&text) && !starts_cmd(&text);
     dbg_log(&format!(
-        "on_enter: dirty={} hangul={} skip={} chars={} line={:?}",
-        was_dirty, has_hangul(&text), skip, text.chars().count(),
-        &text[..text.len().min(200)]
+        "on_enter: dirty={} src={} hangul={} translatable={} chars={} line={:?}",
+        was_dirty, if was_dirty { "screen" } else { "shadow" },
+        has_hangul(&text), translatable, total, &text[..text.len().min(200)]
     ));
-    if skip {
+    if !translatable {
         wr(master, b"\r");
         return Vec::new();
     }
@@ -512,13 +820,12 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         if let Ok(p) = env::var("KOEN_ORIG_FILE") {
             let _ = std::fs::write(p, &text); // shown by the UserPromptSubmit hook
         }
-        // the user may have left the cursor mid-line (arrow-key edit): move
+        // the cursor may be mid-line (arrow-key edit, or mid-recall): move
         // claude's cursor to the end first, then one backspace per char clears
         // the whole box. ponytail: if a wide-char mismatch ever bites, count
         // graphemes instead of chars.
-        let len = buf.len();
-        wr(master, "\x1b[C".repeat(len - cursor).as_bytes());
-        wr(master, &vec![0x7f; len]);
+        wr(master, "\x1b[C".repeat(total - cur_off).as_bytes());
+        wr(master, &vec![0x7f; total]);
         wr(master, eng.as_bytes());
         wr(master, st.suffix.as_bytes());
         // the TUI treats a rapid burst as a paste, and a \r inside a paste
@@ -763,6 +1070,7 @@ fn harness(target: &str, extra: &[String]) -> ! {
     }
 
     MASTER_FD.store(master, std::sync::atomic::Ordering::Relaxed);
+    *SCREEN.lock().unwrap() = Some(Screen::new(ws.ws_row as usize, ws.ws_col as usize));
     let mut old: libc::termios = unsafe { mem::zeroed() };
     if interactive {
         unsafe {
@@ -774,10 +1082,31 @@ fn harness(target: &str, extra: &[String]) -> ! {
         }
     }
 
-    let mut st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, suffix };
+    let mut st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, baseline: Vec::new(), suffix };
     loop {
         if !pump(master, 20) {
             break;
+        }
+        if WINCH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            let mut ws2: libc::winsize = unsafe { mem::zeroed() };
+            if unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws2) } == 0 {
+                if let Ok(mut g) = SCREEN.lock() {
+                    if let Some(s) = g.as_mut() {
+                        s.resize(ws2.ws_row as usize, ws2.ws_col as usize);
+                    }
+                }
+            }
+        }
+        // While the input line is empty and reliable, keep a fresh snapshot of
+        // the prompt row. It's the reference koen later subtracts to read a
+        // recalled (up/down) line without knowing claude's prompt glyphs. Skip
+        // an all-blank row (claude hasn't drawn the prompt yet) so a startup
+        // race can't freeze a useless baseline.
+        if st.buf.is_empty() && !st.dirty {
+            let row = screen_cursor_row();
+            if row.iter().any(|&c| c != ' ' && c != CONT) {
+                st.baseline = row;
+            }
         }
         if readable(0, 0) {
             let mut buf = [0u8; 65536];
@@ -915,7 +1244,7 @@ mod tests {
     fn test_shadow() -> (Shadow, libc::c_int) {
         use std::os::unix::io::IntoRawFd;
         let fd = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap().into_raw_fd();
-        let st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, suffix: "" };
+        let st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, baseline: Vec::new(), suffix: "" };
         (st, fd)
     }
     fn shadow_text(st: &Shadow) -> String {
@@ -958,5 +1287,89 @@ mod tests {
         feed_shadow(&mut st, &bytes[2..]);
         assert_eq!(shadow_text(&st), "안녕");
         assert!(!st.dirty);
+    }
+
+    #[test]
+    fn char_width_korean_is_wide() {
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width('안'), 2);
+        assert_eq!(char_width('中'), 2);
+    }
+
+    #[test]
+    fn screen_basic_cursor_and_erase() {
+        let mut s = Screen::new(3, 20);
+        s.feed(b"hello");
+        assert_eq!(s.c, 5);
+        s.feed(b"\r"); // carriage return
+        assert_eq!(s.c, 0);
+        s.feed(b"HEY");
+        assert_eq!(&s.row_chars(0)[..5], &['H', 'E', 'Y', 'l', 'o']);
+        s.feed(b"\x1b[K"); // erase to end of line from cursor (col 3)
+        assert_eq!(&s.row_chars(0)[..5], &['H', 'E', 'Y', ' ', ' ']);
+        s.feed(b"\x1b[5;3H"); // move cursor (clamped to 3 rows)
+        assert_eq!((s.r, s.c), (2, 2));
+    }
+
+    #[test]
+    fn screen_reads_recalled_line_via_baseline() {
+        // Emulate claude drawing an empty prompt, snapshot it, then redrawing
+        // the row with a recalled Korean line. read_input must recover just the
+        // Korean — no prompt glyph hardcoded.
+        let mut s = Screen::new(3, 40);
+        s.feed("\x1b[3;1H\x1b[K❯ ".as_bytes()); // empty prompt on the bottom row
+        let baseline = s.row_chars(s.r).to_vec();
+        s.feed("\x1b[3;1H\x1b[K❯ 안녕 세계".as_bytes()); // up-arrow recall redraw
+        let (text, off) = s.read_input(&baseline).expect("should read the line");
+        assert_eq!(text, "안녕 세계");
+        assert_eq!(off, text.chars().count()); // cursor left at the end
+    }
+
+    #[test]
+    fn screen_reads_line_inside_a_border_box() {
+        // A bordered box: the left border + prompt are shared with the baseline
+        // (stripped as common prefix); the right border is trimmed as trailing.
+        let mut s = Screen::new(3, 30);
+        s.feed("\x1b[2;1H│ ❯            │".as_bytes());
+        let baseline = s.row_chars(s.r).to_vec();
+        s.feed("\x1b[2;1H│ ❯ 버그 수정   │".as_bytes());
+        let (text, _) = s.read_input(&baseline).expect("should read boxed line");
+        assert_eq!(text, "버그 수정");
+    }
+
+    #[test]
+    fn enter_reads_recalled_line_off_screen_and_swaps() {
+        // Full seam: shadow is dirty (up/down recall), so on_enter must read the
+        // recalled Korean line off the screen model and submit the translation.
+        let mut s = Screen::new(3, 40);
+        s.feed("\x1b[3;1H\x1b[K❯ ".as_bytes());
+        let baseline = s.row_chars(s.r).to_vec();
+        s.feed("\x1b[3;1H\x1b[K❯ 버그 고쳐줘".as_bytes()); // recalled line
+        *SCREEN.lock().unwrap() = Some(s);
+        std::env::set_var("KOEN_FAKE_TRANSLATION", "FIX THE BUG");
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wfd) = (fds[0], fds[1]);
+        let mut st = Shadow {
+            buf: Vec::new(), cursor: 0, pend: Vec::new(),
+            dirty: true, paste: false, baseline, suffix: "",
+        };
+        on_enter(&mut st, wfd);
+        unsafe { libc::close(wfd) };
+
+        let mut out = Vec::new();
+        let mut b = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(rd, b.as_mut_ptr() as *mut _, b.len()) };
+            if n <= 0 { break; }
+            out.extend_from_slice(&b[..n as usize]);
+        }
+        unsafe { libc::close(rd) };
+        let sent = String::from_utf8_lossy(&out);
+        assert!(sent.contains("FIX THE BUG"), "must type the translation: {:?}", sent);
+        assert!(sent.contains('\x7f'), "must erase the recalled line first: {:?}", sent);
+        *SCREEN.lock().unwrap() = None;
+        std::env::remove_var("KOEN_FAKE_TRANSLATION");
     }
 }
