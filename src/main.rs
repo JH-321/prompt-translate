@@ -94,6 +94,15 @@ fn load_config() {
     }
 }
 
+/// First `max` chars of a string, on a char boundary — byte slicing a UTF-8
+/// string (e.g. for a log preview) panics mid-character otherwise.
+fn clip(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 /// Append a line to $KOEN_DEBUG if set. Used to diagnose the harness live:
 /// what the shadow captured, why a line was (not) swapped.
 fn dbg_log(msg: &str) {
@@ -188,7 +197,7 @@ fn run_stdin(cmd: &mut Command, input: &str) -> Result<String, String> {
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("exit {}: {}", out.status, &err[..err.len().min(300)]));
+        return Err(format!("exit {}: {}", out.status, clip(&err, 300)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -250,7 +259,7 @@ fn backend_openrouter(instruction: &str, prompt: &str) -> Result<String, String>
     v["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.trim().to_string())
-        .ok_or_else(|| format!("unexpected response: {}", &out[..out.len().min(200)]))
+        .ok_or_else(|| format!("unexpected response: {}", clip(&out, 200)))
 }
 
 fn hangul_ratio(s: &str) -> f32 {
@@ -363,7 +372,7 @@ fn stop_hook() {
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return;
     }
-    dbg(format!("input: {}", &input[..input.len().min(400)]));
+    dbg(format!("input: {}", clip(&input, 400)));
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&input) else { return };
     // the hook input carries the response directly; the transcript file is a
     // fallback (interactive sessions may not have flushed it to disk yet)
@@ -383,10 +392,10 @@ fn stop_hook() {
     }
     let ko = translate_dir(&text, true);
     if ko == text {
-        dbg(format!("no-op translation for: {}", &text[..text.len().min(200)]));
+        dbg(format!("no-op translation for: {}", clip(&text, 200)));
         return; // translation failed or already Korean: show nothing extra
     }
-    dbg(format!("ok: {}", &ko[..ko.len().min(200)]));
+    dbg(format!("ok: {}", clip(&ko, 200)));
     println!("{}", serde_json::json!({ "systemMessage": ko }));
 }
 
@@ -793,7 +802,7 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         let screen_row = screen_cursor_row().iter().filter(|&&c| c != CONT).collect::<String>();
         dbg_log(&format!(
             "PASTE: shadow_chars={} shadow={:?} | screen_row={:?}",
-            buf.len(), &shadow[..shadow.len().min(300)], screen_row.trim_end()
+            buf.len(), clip(&shadow, 300), screen_row.trim_end()
         ));
     }
 
@@ -825,7 +834,7 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
     dbg_log(&format!(
         "on_enter: dirty={} src={} hangul={} translatable={} chars={} line={:?}",
         was_dirty, if was_dirty { "screen" } else { "shadow" },
-        has_hangul(&text), translatable, total, &text[..text.len().min(200)]
+        has_hangul(&text), translatable, total, clip(&text, 200)
     ));
     if !translatable {
         wr(master, b"\r");
@@ -834,7 +843,7 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
     let (eng, held) = translate_while_pumping(&text, master);
     dbg_log(&format!(
         "on_enter: translated -> swapped={} out={:?}",
-        eng != text && !has_hangul(&eng), &eng[..eng.len().min(200)]
+        eng != text && !has_hangul(&eng), clip(&eng, 200)
     ));
     if eng != text && !has_hangul(&eng) {
         // Erase what's in the box, then type the English. A pasted line may be
