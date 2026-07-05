@@ -201,12 +201,12 @@ fn backend_codex(instruction: &str, prompt: &str) -> Result<String, String> {
         .stderr(Stdio::null())
         .status()
         .map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(&out_file);
+    let _ = std::fs::remove_file(&out_file); // clean up on failure paths too
     if !status.success() {
         return Err(format!("codex exit {}", status));
     }
-    let text = std::fs::read_to_string(&out_file).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&out_file);
-    Ok(text.trim().to_string())
+    Ok(text.map_err(|e| e.to_string())?.trim().to_string())
 }
 
 fn backend_openrouter(instruction: &str, prompt: &str) -> Result<String, String> {
@@ -615,10 +615,12 @@ fn harness(target: &str, extra: &[String]) -> ! {
     //   Korean directly via a per-turn suffix.
     let reply_ko = env::var("KOEN_REPLY").map(|v| v != "en").unwrap_or(true);
     let mut suffix = "";
+    let mut own_orig_file = None; // created by us -> removed on exit
     if target == "claude" {
         if env::var("KOEN_ORIG_FILE").is_err() {
             let p = env::temp_dir().join(format!("koen-orig-{}.txt", std::process::id()));
             env::set_var("KOEN_ORIG_FILE", &p); // inherited by claude -> hooks
+            own_orig_file = Some(p);
         }
         let exe = env::current_exe()
             .map(|p| p.display().to_string())
@@ -722,6 +724,9 @@ fn harness(target: &str, extra: &[String]) -> ! {
 
     if interactive {
         unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &old) };
+    }
+    if let Some(p) = own_orig_file {
+        let _ = std::fs::remove_file(p);
     }
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
