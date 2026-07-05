@@ -220,7 +220,11 @@ fn watchdog(pid: u32, secs: u64) -> Watchdog {
                 return; // child already finished
             }
         }
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // re-check right before killing: the child may have finished (and its pid
+        // been recycled) in the last interval — don't SIGKILL an innocent pid
+        if !f.load(std::sync::atomic::Ordering::Relaxed) {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
     });
     Watchdog(flag)
 }
@@ -656,11 +660,15 @@ impl Screen {
                     }
                 }
                 2 => { // CSI: collect until final byte 0x40..=0x7e
-                    if (0x40..=0x7e).contains(&b) {
+                    if b == 0x1b {
+                        self.st = 1; // a new ESC aborts this CSI and starts over
+                    } else if (0x40..=0x7e).contains(&b) {
                         self.csi_dispatch(b);
                         self.st = 0;
-                    } else {
+                    } else if self.csi.len() < 256 {
                         self.csi.push(b);
+                    } else {
+                        self.st = 0; // malformed, never-terminating CSI: abandon it
                     }
                 }
                 3 => { // OSC: skip until BEL or ESC \
@@ -766,7 +774,9 @@ fn clear_via_kill(baseline: &[char], master: libc::c_int) -> bool {
 static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Restores the terminal to `old` (cooked) mode on drop — the safety net if the
-/// harness unwinds on a panic instead of reaching its explicit restore.
+/// harness unwinds on a panic instead of reaching its explicit restore. Relies
+/// on the default `panic = "unwind"`; do not set `panic = "abort"` in a profile
+/// or a panic would leave the terminal in raw mode.
 struct TermiosGuard(libc::termios);
 impl Drop for TermiosGuard {
     fn drop(&mut self) {
@@ -1002,9 +1012,12 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
                 pump(master, 50);
             }
         } else {
-            // couldn't clear the chip — leave the paste untouched and submit it
-            // as-is rather than corrupt it (claude expands it to the full text)
-            dbg_log("on_enter: paste box not cleared; submitting paste untranslated");
+            // We already sent Ctrl-U, so the box is (in real claude) now empty —
+            // submitting a bare \r would send an EMPTY prompt and lose the user's
+            // text. Don't submit: leave the box as it is for the user to retype,
+            // rather than risk an empty send or a corrupted line.
+            dbg_log("on_enter: box not confirmed clear; not submitting");
+            return held;
         }
     }
     wr_master(master, b"\r");
