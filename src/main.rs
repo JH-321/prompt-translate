@@ -323,6 +323,22 @@ fn last_assistant_text(transcript: &str) -> String {
     last
 }
 
+/// Claude Code UserPromptSubmit hook: show the Korean line the user actually
+/// typed (stashed by the harness right before the English swap) as a native
+/// systemMessage under the submitted prompt. Display-only — zero tokens.
+fn prompt_hook() {
+    let Ok(path) = env::var("KOEN_ORIG_FILE") else { return };
+    let Ok(orig) = std::fs::read_to_string(&path) else { return };
+    if orig.trim().is_empty() {
+        return;
+    }
+    let _ = std::fs::write(&path, ""); // consume: only show once
+    println!(
+        "{}",
+        serde_json::json!({ "systemMessage": format!("원문: {}", orig.trim()) })
+    );
+}
+
 /// Claude Code Stop hook: translate the English response to Korean with the
 /// cheap model and hand it back as a systemMessage, which the TUI renders
 /// natively under the response. This keeps the expensive model's output in
@@ -473,6 +489,9 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
     }
     let (eng, held) = translate_while_pumping(&text, master);
     if eng != text && !has_hangul(&eng) {
+        if let Ok(p) = env::var("KOEN_ORIG_FILE") {
+            let _ = std::fs::write(p, &text); // shown by the UserPromptSubmit hook
+        }
         // ponytail: one backspace per char erases the input box; if a
         // grapheme/wide-char mismatch ever bites, count graphemes instead
         wr(master, &vec![0x7f; text.chars().count()]);
@@ -586,31 +605,41 @@ fn harness(target: &str, extra: &[String]) -> ! {
             args.push(a.clone());
         }
     }
-    // reply-in-Korean, cheap-model edition (disable with KOEN_REPLY=en):
-    // - claude: the upper model answers in English (minimal output tokens);
-    //   a session-scoped Stop hook (`koen --stop-hook`) translates the
-    //   response with the cheap model and the TUI shows it natively.
+    // Korean display without expensive-model Korean tokens (KOEN_REPLY=en
+    // disables the reply translation):
+    // - claude: session-scoped hooks are injected via --settings.
+    //   UserPromptSubmit echoes the Korean line the user typed (stashed in
+    //   KOEN_ORIG_FILE before the English swap); Stop translates the English
+    //   response with the cheap model. Both render natively as systemMessage.
     // - codex: no hook channel, so the upper model is asked to reply in
     //   Korean directly via a per-turn suffix.
     let reply_ko = env::var("KOEN_REPLY").map(|v| v != "en").unwrap_or(true);
     let mut suffix = "";
-    if reply_ko {
-        if target == "claude" {
-            let exe = env::current_exe()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "koen".into());
-            args.push("--settings".into());
-            args.push(
-                serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{
-                    "type": "command",
-                    "command": format!("'{}' --stop-hook", exe),
-                    "timeout": 120
-                }]}]}})
-                .to_string(),
-            );
-        } else {
-            suffix = REPLY_KO_SUFFIX;
+    if target == "claude" {
+        if env::var("KOEN_ORIG_FILE").is_err() {
+            let p = env::temp_dir().join(format!("koen-orig-{}.txt", std::process::id()));
+            env::set_var("KOEN_ORIG_FILE", &p); // inherited by claude -> hooks
         }
+        let exe = env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "koen".into());
+        let mut hooks = serde_json::json!({
+            "UserPromptSubmit": [{ "hooks": [{
+                "type": "command",
+                "command": format!("'{}' --prompt-hook", exe)
+            }]}]
+        });
+        if reply_ko {
+            hooks["Stop"] = serde_json::json!([{ "hooks": [{
+                "type": "command",
+                "command": format!("'{}' --stop-hook", exe),
+                "timeout": 120
+            }]}]);
+        }
+        args.push("--settings".into());
+        args.push(serde_json::json!({ "hooks": hooks }).to_string());
+    } else if reply_ko {
+        suffix = REPLY_KO_SUFFIX;
     }
     let mut cmd: Vec<String> = env::var("KOEN_HARNESS_CMD")
         .ok()
@@ -714,6 +743,10 @@ fn main() {
         }
         Some("--stop-hook") => {
             stop_hook();
+            return;
+        }
+        Some("--prompt-hook") => {
+            prompt_hook();
             return;
         }
         Some("claude") | Some("codex") => harness(&args[0].clone(), &args[1..]),

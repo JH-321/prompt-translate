@@ -38,6 +38,14 @@ case "$(cat "$cap")" in
   *) echo "FAIL codex suffix: $(cat "$cap")"; exit 1 ;;
 esac
 
+# swap stashes the Korean original; --prompt-hook shows it once, then clears
+printf '안녕하세요 세계\r' | KOEN_ORIG_FILE="$dir/orig" KOEN_HARNESS_CMD="$dir/child.sh" KOEN_FAKE_TRANSLATION="SWAPPED" "$bin" claude >/dev/null 2>&1 || true
+[ "$(cat "$dir/orig")" = "안녕하세요 세계" ] || { echo "FAIL orig stash: $(cat "$dir/orig")"; exit 1; }
+out=$(KOEN_ORIG_FILE="$dir/orig" "$bin" --prompt-hook)
+[ "$out" = '{"systemMessage":"원문: 안녕하세요 세계"}' ] || { echo "FAIL prompt-hook: $out"; exit 1; }
+out=$(KOEN_ORIG_FILE="$dir/orig" "$bin" --prompt-hook)
+[ -z "$out" ] || { echo "FAIL prompt-hook not consumed: $out"; exit 1; }
+
 # stop hook: last_assistant_message field is preferred (no transcript needed)
 out=$(printf '{"last_assistant_message":"All done."}' | KOEN_FAKE_TRANSLATION="모두 완료했습니다." "$bin" --stop-hook)
 case "$out" in
