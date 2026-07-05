@@ -761,6 +761,7 @@ struct Shadow {
     pend: Vec<u8>,   // bytes of a split utf-8 char
     dirty: bool,     // up/down/tab-complete: shadow unreliable, read screen
     paste: bool,     // inside bracketed paste
+    paste_seen: bool, // this line included a bracketed paste (claude may collapse it to a [Pasted text] chip)
     baseline: Vec<char>, // empty-prompt row, snapshot while the line is empty
     suffix: &'static str, // appended after a swapped (translated) line
 }
@@ -776,6 +777,20 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
     st.cursor = 0;
     st.pend.clear();
     let was_dirty = mem::replace(&mut st.dirty, false);
+    let paste_seen = mem::replace(&mut st.paste_seen, false);
+
+    // Instrument the paste case: the shadow holds the full pasted text, but
+    // claude may show a collapsed [Pasted text] chip whose char count differs
+    // from ours — log both so we can see how the box actually renders before
+    // deciding how to erase/skip it.
+    if paste_seen && env::var("KOEN_DEBUG").is_ok() {
+        let shadow: String = buf.iter().collect();
+        let screen_row = screen_cursor_row().iter().filter(|&&c| c != CONT).collect::<String>();
+        dbg_log(&format!(
+            "PASTE: shadow_chars={} shadow={:?} | screen_row={:?}",
+            buf.len(), &shadow[..shadow.len().min(300)], screen_row.trim_end()
+        ));
+    }
 
     // The true input line + cursor char-offset. When the shadow is reliable
     // (ordinary typing/editing) it is exact; when it went dirty (up/down recall,
@@ -886,7 +901,7 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
             let end = j.min(q.len() - 1);
             let seq = &q[i..=end];
             match seq {
-                b"\x1b[200~" => st.paste = true,
+                b"\x1b[200~" => { st.paste = true; st.paste_seen = true; }
                 b"\x1b[201~" => st.paste = false,
                 // Cursor moves / edits within the line: track them so a prompt
                 // fixed up with arrow keys still gets translated. Left/Right,
@@ -942,6 +957,7 @@ fn process_input(st: &mut Shadow, input: &[u8], master: libc::c_int) {
             st.cursor = 0;
             st.pend.clear();
             st.dirty = false;
+            st.paste_seen = false;
             wr(master, &q[i..=i]);
             i += 1;
         } else {
@@ -1082,7 +1098,7 @@ fn harness(target: &str, extra: &[String]) -> ! {
         }
     }
 
-    let mut st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, baseline: Vec::new(), suffix };
+    let mut st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, paste_seen: false, baseline: Vec::new(), suffix };
     loop {
         if !pump(master, 20) {
             break;
@@ -1244,7 +1260,7 @@ mod tests {
     fn test_shadow() -> (Shadow, libc::c_int) {
         use std::os::unix::io::IntoRawFd;
         let fd = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap().into_raw_fd();
-        let st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, baseline: Vec::new(), suffix: "" };
+        let st = Shadow { buf: Vec::new(), cursor: 0, pend: Vec::new(), dirty: false, paste: false, paste_seen: false, baseline: Vec::new(), suffix: "" };
         (st, fd)
     }
     fn shadow_text(st: &Shadow) -> String {
@@ -1353,7 +1369,7 @@ mod tests {
         let (rd, wfd) = (fds[0], fds[1]);
         let mut st = Shadow {
             buf: Vec::new(), cursor: 0, pend: Vec::new(),
-            dirty: true, paste: false, baseline, suffix: "",
+            dirty: true, paste: false, paste_seen: false, baseline, suffix: "",
         };
         on_enter(&mut st, wfd);
         unsafe { libc::close(wfd) };
