@@ -617,8 +617,13 @@ fn harness(target: &str, extra: &[String]) -> ! {
     //   Korean directly via a per-turn suffix.
     // KOEN_YOLO=1 skips all permission/approval prompts in the upper TUI
     // (claude bypass-permissions, codex --yolo). Off by default; opt in via
-    // ~/.koenrc so a fresh install never auto-runs without asking.
-    if env::var("KOEN_YOLO").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+    // ~/.koenrc so a fresh install never auto-runs without asking. This
+    // disables every safety prompt, so it fails CLOSED: only explicit truthy
+    // values enable it — KOEN_YOLO=false/off/no stays safe, not accidentally on.
+    let yolo = env::var("KOEN_YOLO")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if yolo {
         args.push(if target == "claude" {
             "--dangerously-skip-permissions".into()
         } else {
