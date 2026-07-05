@@ -138,6 +138,11 @@ KOEN_CLAUDE_MODEL=claude-haiku-4-5
 | `KOEN_OPENROUTER_MODEL` | OpenRouter model ID | `meta-llama/llama-3.3-70b-instruct:free` |
 | `OPENROUTER_API_KEY` | Required for the OpenRouter backend | — |
 | `KOEN_REPLY` | `en` = leave responses untranslated | Korean translation on |
+| `KOEN_YOLO` | `1` = skip all permission/approval prompts in the harness (claude `--dangerously-skip-permissions`, codex `--yolo`) | off (prompts on) |
+
+`KOEN_YOLO` is **off by default** so a fresh install never runs commands
+without asking. Turn it on only in a trusted directory by uncommenting
+`KOEN_YOLO=1` in `~/.koenrc` (or `KOEN_YOLO=1 koen claude` for one session).
 
 The **upper** model is not koen's business — set it the way you always do
 (`koen claude --model claude-opus-4-8`, or `/model` inside the session).

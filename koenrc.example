@@ -16,3 +16,8 @@ KOEN_CLAUDE_MODEL=claude-haiku-4-5
 
 # 응답을 영어 그대로 받으려면 en (기본: 한국어 번역 표시)
 #KOEN_REPLY=en
+
+# koen claude / koen codex 실행 시 모든 권한·승인 프롬프트 건너뛰기
+# (claude는 bypass-permissions, codex는 --yolo). 기본: 꺼짐(안전).
+# 켜면 확인 없이 명령을 실행하므로 신뢰하는 환경에서만 사용하세요.
+#KOEN_YOLO=1

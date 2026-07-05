@@ -25,6 +25,8 @@ Usage:
                                      # lines via the cheap model, and submits
                                      # English — dialogs/skills/settings intact
     koen claude --lower haiku        # pick the cheap translator model
+    KOEN_YOLO=1 koen claude          # skip all permission/approval prompts
+                                     # (claude bypass-permissions, codex --yolo)
 
 Harness rules:
     - responses are shown in Korean, cheaply: with claude the upper model
@@ -613,6 +615,16 @@ fn harness(target: &str, extra: &[String]) -> ! {
     //   response with the cheap model. Both render natively as systemMessage.
     // - codex: no hook channel, so the upper model is asked to reply in
     //   Korean directly via a per-turn suffix.
+    // KOEN_YOLO=1 skips all permission/approval prompts in the upper TUI
+    // (claude bypass-permissions, codex --yolo). Off by default; opt in via
+    // ~/.koenrc so a fresh install never auto-runs without asking.
+    if env::var("KOEN_YOLO").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        args.push(if target == "claude" {
+            "--dangerously-skip-permissions".into()
+        } else {
+            "--yolo".into()
+        });
+    }
     let reply_ko = env::var("KOEN_REPLY").map(|v| v != "en").unwrap_or(true);
     let mut suffix = "";
     let mut own_orig_file = None; // created by us -> removed on exit

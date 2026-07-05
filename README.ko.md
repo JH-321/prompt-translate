@@ -126,6 +126,12 @@ KOEN_CLAUDE_MODEL=claude-haiku-4-5
 | `KOEN_CODEX_MODEL` | codex 백엔드의 번역 모델 (`codex exec -m <값>`) | codex 설정(`~/.codex/config.toml`)의 기본 모델 |
 | `KOEN_OPENROUTER_MODEL` | OpenRouter 모델 ID | `meta-llama/llama-3.3-70b-instruct:free` |
 | `OPENROUTER_API_KEY` | OpenRouter 사용 시 필수 (없으면 이 백엔드는 후보에서 제외) | — |
+| `KOEN_REPLY` | `en` = 응답을 영어 그대로 (번역 안 함) | 한국어 번역 켜짐 |
+| `KOEN_YOLO` | `1` = 하네스에서 모든 권한·승인 프롬프트 건너뛰기 (claude `--dangerously-skip-permissions`, codex `--yolo`) | 꺼짐(프롬프트 표시) |
+
+`KOEN_YOLO`는 **기본값이 꺼짐**이라 갓 설치한 사람은 확인 없이 명령이
+실행되지 않습니다. 신뢰하는 디렉터리에서만 `~/.koenrc`의 `KOEN_YOLO=1`
+주석을 풀어 켜세요(또는 한 세션만 `KOEN_YOLO=1 koen claude`).
 
 ```bash
 # 일회성 오버라이드 예시 (~/.koenrc보다 우선)
