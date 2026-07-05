@@ -6,7 +6,7 @@
 
 `koen`은 프롬프트가 비싼 모델에 도달하기 **전에**, 싼 모델(Claude Haiku,
 Codex mini, 무료 OpenRouter 모델)로 한국어→영어 변환을 수행하는 CLI + Claude
-Code 스킬입니다. 기계번역(Papago/Google Translate)과 달리 LLM 번역이라
+Code 하네스입니다. 기계번역(Papago/Google Translate)과 달리 LLM 번역이라
 기술 용어·제약조건·뉘앙스가 유지되고, 코드블록·URL은 아예 모델에 보내지 않고
 원문 그대로 복원합니다.
 
@@ -20,7 +20,7 @@ Code 스킬입니다. 기계번역(Papago/Google Translate)과 달리 LLM 번역
 ```bash
 git clone https://github.com/JH-321/prompt-translate
 cd prompt-translate
-make install   # cargo build 후 /usr/local/bin/koen + ~/.claude/skills/koen 링크
+make install   # cargo build 후 /usr/local/bin/koen 링크 + ~/.koenrc 생성
 ```
 
 요구사항: Rust(`cargo`) + 백엔드 하나 이상 (`claude` CLI / `codex` CLI /
@@ -132,18 +132,15 @@ KOEN_BACKEND=codex KOEN_CODEX_MODEL=gpt-5-mini koen "한국어 프롬프트"
 koen 설정이 아니라 내부 CLI 인자(`koen claude --model claude-opus-4-8`)나
 세션 안의 `/model`로 바꿉니다.
 
-## Claude Code 통합
+## 왜 훅/스킬 통합이 없나
 
-**스킬 (`~/.claude/skills/koen`)** — `make install`로 설치됨. 한국어 기획서나
-긴 한국어 텍스트를 작업 입력으로 주면, Claude가 비싼 모델 토큰으로 직접
-번역하는 대신 `koen`을 Bash로 호출해 싼 모델로 변환한 뒤 영어본으로 작업합니다.
-
-**훅은 왜 없나** — Claude Code의 `UserPromptSubmit` 훅은 프롬프트를
-*교체*할 수 없고 원문 옆에 컨텍스트를 *추가*만 할 수 있습니다(공식 훅 스펙:
-`additionalContext`). 한국어 원문 + 영어 번역이 둘 다 모델에 들어가면 토큰이
-오히려 늘어나므로, 훅 통합은 의도적으로 제외했습니다. 절약이 실제로 일어나는
-지점은 프롬프트가 비싼 모델에 들어가기 전 경계뿐입니다: 파이프(`koen | claude -p`)
-또는 스킬(문서 변환).
+Claude Code의 `UserPromptSubmit` 훅은 프롬프트를 *교체*할 수 없고 원문 옆에
+컨텍스트를 *추가*만 할 수 있습니다(공식 훅 스펙 + 실험으로 확인). 한국어
+원문 + 영어 번역이 둘 다 모델에 들어가면 토큰이 오히려 늘어납니다. 스킬
+방식도 마찬가지로 한국어가 이미 비싼 모델 컨텍스트에 들어간 뒤에야 동작하므로
+제외했습니다. 절약이 실제로 일어나는 지점은 프롬프트가 비싼 모델에 들어가기
+전 경계뿐이고, 그게 koen 하네스(pty)와 파이프(`koen | claude -p`)입니다.
+한국어 문서 파일은 `koen -f 파일.md`로 미리 변환해서 쓰면 됩니다.
 
 ## 언제 쓰고 언제 안 쓰나
 
@@ -153,9 +150,10 @@ koen 설정이 아니라 내부 CLI 인자(`koen claude --model claude-opus-4-8`
 
 | 상황 | 한국어가 상위 모델에 도달? | 권장 |
 |------|------|------|
-| 한국어 기획서/스펙을 **파일 경로로** 전달 | ❌ (koen이 디스크에서 직접 읽음) | ✅ `koen -f` — 절약 큼 |
+| `koen claude`/`koen codex` 하네스에서 타이핑 | ❌ (Enter 시점에 영어로 교체) | ✅ 기본 사용법 |
+| 한국어 문서를 미리 변환 (`koen -f 기획서.md`) | ❌ | ✅ 긴 스펙에 유용 |
 | 헤드리스 배치 (`koen \| claude -p`) | ❌ | ✅ 완전 절약 |
-| 대화창에 한국어를 타이핑/붙여넣기 | ⭕ 이미 도달 (토큰 이미 소모됨) | ❌ 번역하면 이중 비용 |
+| 맨 `claude`에 한국어를 직접 입력 | ⭕ 한국어 토큰 그대로 소모 | ❌ `koen claude`를 쓰세요 |
 
 ## 테스트
 
