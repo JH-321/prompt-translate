@@ -1,0 +1,18 @@
+# koen 설정 파일 — ~/.koenrc 로 복사하면 매번 환경변수를 줄 필요가 없습니다.
+# 셸 환경변수가 있으면 이 파일보다 우선합니다. `export KEY=값` 형식도 허용.
+
+# 번역 백엔드 강제 지정: claude | codex | openrouter (기본: 자동 감지)
+#KOEN_BACKEND=claude
+
+# claude 백엔드의 번역(하위) 모델
+KOEN_CLAUDE_MODEL=claude-haiku-4-5
+
+# codex 백엔드의 번역 모델 (기본: ~/.codex/config.toml의 모델)
+#KOEN_CODEX_MODEL=gpt-5-mini
+
+# OpenRouter 모델과 API 키
+#KOEN_OPENROUTER_MODEL=meta-llama/llama-3.3-70b-instruct:free
+#OPENROUTER_API_KEY=sk-or-...
+
+# 응답을 영어 그대로 받으려면 en (기본: 한국어 번역 표시)
+#KOEN_REPLY=en

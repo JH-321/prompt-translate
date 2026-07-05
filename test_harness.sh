@@ -24,6 +24,13 @@ printf '/goal 한국어 목표\r' | run in "X"
 
 [ "$("$bin" "plain english, no api call")" = "plain english, no api call" ] || { echo "FAIL cli passthrough"; exit 1; }
 
+# config file (~/.koenrc via KOEN_CONFIG) supplies settings; env still wins
+printf '# comment\nexport KOEN_FAKE_TRANSLATION="FROM CONFIG"\n' > "$dir/rc"
+out=$(KOEN_CONFIG="$dir/rc" "$bin" "한국어 입력")
+[ "$out" = "FROM CONFIG" ] || { echo "FAIL config load: $out"; exit 1; }
+out=$(KOEN_CONFIG="$dir/rc" KOEN_FAKE_TRANSLATION="FROM ENV" "$bin" "한국어 입력")
+[ "$out" = "FROM ENV" ] || { echo "FAIL env precedence: $out"; exit 1; }
+
 # codex target: reply-in-Korean suffix appended after the swap
 printf '한국어 입력\r' | KOEN_HARNESS_CMD="$dir/child.sh" KOEN_FAKE_TRANSLATION="SWAPPED" "$bin" codex >/dev/null 2>&1 || true
 case "$(cat "$cap")" in
