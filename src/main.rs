@@ -679,6 +679,11 @@ fn screen_read_input(baseline: &[char]) -> Option<(String, usize)> {
     SCREEN.lock().ok().and_then(|g| g.as_ref().and_then(|s| s.read_input(baseline)))
 }
 
+/// True when the screen's input row is back to the empty prompt (baseline).
+fn screen_input_empty(baseline: &[char]) -> bool {
+    screen_read_input(baseline).is_none()
+}
+
 static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn on_winch(_: libc::c_int) {
@@ -832,22 +837,54 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         eng != text && !has_hangul(&eng), &eng[..eng.len().min(200)]
     ));
     if eng != text && !has_hangul(&eng) {
-        if let Ok(p) = env::var("KOEN_ORIG_FILE") {
-            let _ = std::fs::write(p, &text); // shown by the UserPromptSubmit hook
-        }
-        // the cursor may be mid-line (arrow-key edit, or mid-recall): move
-        // claude's cursor to the end first, then one backspace per char clears
-        // the whole box. ponytail: if a wide-char mismatch ever bites, count
-        // graphemes instead of chars.
-        wr(master, "\x1b[C".repeat(total - cur_off).as_bytes());
-        wr(master, &vec![0x7f; total]);
-        wr(master, eng.as_bytes());
-        wr(master, st.suffix.as_bytes());
-        // the TUI treats a rapid burst as a paste, and a \r inside a paste
-        // inserts a newline instead of submitting — pause so the Enter
-        // registers as its own keypress
-        for _ in 0..6 {
-            pump(master, 50);
+        // Erase what's in the box, then type the English. A pasted line may be
+        // collapsed by claude into a [Pasted text] chip whose char count is not
+        // ours, so backspacing our count would be wrong — kill the line and
+        // verify it actually emptied; only swap when it did.
+        let cleared = if paste_seen {
+            // Without a reliable empty-prompt baseline we can't confirm a clear,
+            // so don't risk killing the line and submitting an empty prompt —
+            // leave the paste untouched.
+            if st.baseline.iter().any(|&c| c != ' ' && c != CONT) {
+                let mut ok = false;
+                for _ in 0..3 {
+                    wr(master, &[0x15]); // Ctrl-U: kill the whole input line
+                    for _ in 0..4 {
+                        pump(master, 15); // let claude redraw before checking
+                    }
+                    if screen_input_empty(&st.baseline) {
+                        ok = true;
+                        break;
+                    }
+                }
+                ok
+            } else {
+                false
+            }
+        } else {
+            // ordinary line: move a possibly mid-line cursor to the end, then
+            // one backspace per char clears it exactly. ponytail: if a wide-char
+            // mismatch ever bites, count graphemes instead of chars.
+            wr(master, "\x1b[C".repeat(total - cur_off).as_bytes());
+            wr(master, &vec![0x7f; total]);
+            true
+        };
+        if cleared {
+            if let Ok(p) = env::var("KOEN_ORIG_FILE") {
+                let _ = std::fs::write(p, &text); // shown by the UserPromptSubmit hook
+            }
+            wr(master, eng.as_bytes());
+            wr(master, st.suffix.as_bytes());
+            // the TUI treats a rapid burst as a paste, and a \r inside a paste
+            // inserts a newline instead of submitting — pause so the Enter
+            // registers as its own keypress
+            for _ in 0..6 {
+                pump(master, 50);
+            }
+        } else {
+            // couldn't clear the chip — leave the paste untouched and submit it
+            // as-is rather than corrupt it (claude expands it to the full text)
+            dbg_log("on_enter: paste box not cleared; submitting paste untranslated");
         }
     }
     wr(master, b"\r");
@@ -855,8 +892,11 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
 }
 
 fn feed_shadow(st: &mut Shadow, chunk: &[u8]) {
-    if chunk.iter().any(|&c| c < 0x20) {
-        st.dirty = true; // tab-complete or other control key
+    // A control char normally means tab-complete / a cursor key → shadow
+    // untrustworthy. But inside a bracketed paste every byte is literal content
+    // (a tab in pasted code, etc.), so it must NOT mark the shadow dirty.
+    if !st.paste && chunk.iter().any(|&c| c < 0x20) {
+        st.dirty = true;
     }
     st.pend.extend(chunk.iter().filter(|&&c| c >= 0x20));
     let decoded = match std::str::from_utf8(&st.pend) {
@@ -871,7 +911,9 @@ fn feed_shadow(st: &mut Shadow, chunk: &[u8]) {
             st.pend.drain(..valid);
             if e.error_len().is_some() || st.pend.len() > 8 {
                 st.pend.clear(); // garbage, not a split utf-8 char
-                st.dirty = true;
+                if !st.paste {
+                    st.dirty = true;
+                }
             }
             s
         }
@@ -1303,6 +1345,17 @@ mod tests {
         feed_shadow(&mut st, &bytes[2..]);
         assert_eq!(shadow_text(&st), "안녕");
         assert!(!st.dirty);
+    }
+
+    #[test]
+    fn paste_with_tab_stays_translatable() {
+        // a tab inside a paste is literal content, not a cursor key: the line
+        // must stay clean (not dirty) so the shadow's full text is used.
+        let (mut st, fd) = test_shadow();
+        process_input(&mut st, "\x1b[200~함수\t정의 확인\x1b[201~".as_bytes(), fd);
+        assert!(!st.dirty, "paste content (incl. tab) must not go dirty");
+        assert!(st.paste_seen);
+        assert_eq!(shadow_text(&st), "함수정의 확인"); // tab filtered, text kept
     }
 
     #[test]

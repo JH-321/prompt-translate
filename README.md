@@ -96,6 +96,7 @@ Rules of the road:
 | English line | passes through untouched — zero cost |
 | Line starting with `/` `!` `#` | never translated: skill names & command args stay intact |
 | Line edited with arrows, or recalled with up/down history | still translated — koen reads the real input box off an emulated screen |
+| Pasted block (claude may collapse it to a `[Pasted text]` chip) | koen has the full text; it kills the line and retypes English once the box is confirmed clear, else submits the paste untouched — never corrupted |
 | Code fences, `` `inline` ``, `"quotes"`, `'quotes'`, URLs | never sent to the translator, restored verbatim |
 | Translation failure | original line submitted — the session never breaks |
 
