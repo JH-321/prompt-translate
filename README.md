@@ -30,28 +30,36 @@ make install   # /usr/local/bin/koen + ~/.claude/skills/koen 심볼릭 링크
 
 ### 하네스 모드 — `koen claude` / `koen codex`
 
-터미널에서 상위 모델을 koen이 감싸서 실행합니다. 입력창에서 한글/영어를
-받으면, 한글은 싼 모델(Haiku)이 의미 손실 없이 영어로 변환하고(변환문이
-회색으로 표시됨), **상위 모델에는 영어만 도달**합니다. 대화 세션은 턴 사이에
-유지됩니다.
+**진짜 Claude Code / Codex TUI를 그대로 실행합니다.** koen은 pty(가상
+터미널)로 감싸서 화면 출력은 손대지 않고 통과시키고, 입력만 감시합니다:
+Enter를 누른 순간 입력줄에 한글이 있으면 싼 모델(Haiku)로 번역해서 입력창의
+한글을 지우고 영어로 바꿔 제출합니다. **상위 모델에는 영어만 도달합니다.**
+
+권한 다이얼로그, 선택지(AskUserQuestion), shift+tab 권한 모드 전환,
+`/model`, 스킬, goal, config, 스트리밍 — Claude Code가 지원하는 모든 것이
+그대로 동작합니다. koen이 UI를 재구현한 게 아니라 진짜 TUI이기 때문입니다.
 
 ```bash
-koen claude                          # claude를 내부적으로 구동
-koen codex                           # codex를 내부적으로 구동
-koen claude -- --model claude-opus-4-8   # -- 뒤는 내부 CLI에 그대로 전달
-
-koen> 로그인 버그 고쳐줘. src/auth.ts 봐.
-→ Fix the login bug. Look at src/auth.ts.     # 싼 모델의 번역 (회색)
-[상위 모델의 응답이 여기 표시됨]
+koen claude                          # 진짜 claude TUI, 입력만 번역
+koen codex                           # 진짜 codex TUI
+koen claude --model claude-opus-4-8  # 인자는 전부 내부 CLI로 그대로 전달
+koen claude --lower haiku            # 번역기(하위 모델)만 koen이 소비하는 플래그
 ```
 
-REPL 명령: `/raw <텍스트>`(번역 없이 전송), `/exit`·`/quit`·Ctrl-D(종료).
-영어 입력은 번역 단계를 건너뜁니다(비용 0).
+상위 모델은 평소처럼 `--model`이나 `/model`로, 하위(번역) 모델은
+`--lower` 또는 `KOEN_CLAUDE_MODEL` 환경변수로 지정합니다.
 
-제약: 내부 모델은 비대화형(`claude -p` / `codex exec`)으로 돌기 때문에 툴
-권한 프롬프트에 답할 수 없습니다. 권한이 필요한 작업은
-`koen claude -- --permission-mode acceptEdits` 처럼 플래그를 넘기세요.
-응답은 턴이 끝날 때 한 번에 출력됩니다(스트리밍 없음).
+동작 규칙:
+- 영어 입력 → 번역 단계 생략, 그대로 통과 (비용 0)
+- `/`, `!`, `#` 로 시작하는 줄(슬래시/배시 명령) → 번역하지 않음
+- 화살표 키·탭 완성으로 편집한 줄 → 안전을 위해 번역하지 않고 그대로 제출
+- 번역 실패 → 원문 그대로 제출 (세션이 깨지지 않음)
+- Enter 후 번역되는 몇 초 동안 입력창에 한글이 남아 있다가 영어로 바뀌며 제출됨
+
+*왜 훅이 아니라 pty인가*: Claude Code의 UserPromptSubmit/UserPromptExpansion
+훅은 프롬프트를 교체할 수 없다는 것을 문서와 실험으로 확인했습니다
+(`additionalContext` 추가만 가능 — 원문이 항상 모델에 전달됨). 네이티브
+UX를 유지하면서 입력을 가로채는 유일한 지점이 pty입니다.
 
 ### 단발 변환
 
