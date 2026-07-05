@@ -28,6 +28,33 @@ make install   # /usr/local/bin/koen + ~/.claude/skills/koen 심볼릭 링크
 
 ## 사용법
 
+### 하네스 모드 — `koen claude` / `koen codex`
+
+터미널에서 상위 모델을 koen이 감싸서 실행합니다. 입력창에서 한글/영어를
+받으면, 한글은 싼 모델(Haiku)이 의미 손실 없이 영어로 변환하고(변환문이
+회색으로 표시됨), **상위 모델에는 영어만 도달**합니다. 대화 세션은 턴 사이에
+유지됩니다.
+
+```bash
+koen claude                          # claude를 내부적으로 구동
+koen codex                           # codex를 내부적으로 구동
+koen claude -- --model claude-opus-4-8   # -- 뒤는 내부 CLI에 그대로 전달
+
+koen> 로그인 버그 고쳐줘. src/auth.ts 봐.
+→ Fix the login bug. Look at src/auth.ts.     # 싼 모델의 번역 (회색)
+[상위 모델의 응답이 여기 표시됨]
+```
+
+REPL 명령: `/raw <텍스트>`(번역 없이 전송), `/exit`·`/quit`·Ctrl-D(종료).
+영어 입력은 번역 단계를 건너뜁니다(비용 0).
+
+제약: 내부 모델은 비대화형(`claude -p` / `codex exec`)으로 돌기 때문에 툴
+권한 프롬프트에 답할 수 없습니다. 권한이 필요한 작업은
+`koen claude -- --permission-mode acceptEdits` 처럼 플래그를 넘기세요.
+응답은 턴이 끝날 때 한 번에 출력됩니다(스트리밍 없음).
+
+### 단발 변환
+
 ```bash
 koen "src/auth.ts 파일에서 로그인 실패 시 429를 반환하도록 수정해줘"
 # -> Modify src/auth.ts to return 429 when login fails.

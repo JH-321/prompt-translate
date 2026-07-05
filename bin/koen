@@ -10,6 +10,14 @@ Usage:
     echo "한국어 프롬프트" | koen
     koen -f spec.ko.md > spec.en.md
 
+    koen claude [-- <claude args>]   # interactive harness: you type Korean,
+    koen codex  [-- <codex args>]    # a cheap model translates, the expensive
+                                     # model only ever receives English
+
+Harness REPL commands:
+    /raw <text>   send without translation
+    /exit, /quit  leave (Ctrl-D works too)
+
 Backends (auto-detected, or force with KOEN_BACKEND=claude|codex|openrouter):
     claude     -> claude -p --model $KOEN_CLAUDE_MODEL   (default: claude-haiku-4-5)
     codex      -> codex exec [-m $KOEN_CODEX_MODEL]      (default: codex config default)
@@ -158,11 +166,69 @@ def translate(text):
     return text
 
 
+DIM, RESET = "\033[2m", "\033[0m"
+
+
+def turn_cmd(target, session, first, extra, prompt):
+    """Build the upper-model command for one conversation turn."""
+    if target == "claude":
+        sess = ["--session-id", session] if first else ["--resume", session]
+        return ["claude", "-p"] + sess + extra + [prompt]
+    # ponytail: codex resume --last races with other concurrent codex sessions;
+    # capture the session id from JSON output if that ever bites
+    base = ["codex", "exec", "--skip-git-repo-check"]
+    if not first:
+        base += ["resume", "--last"]
+    return base + extra + [prompt]
+
+
+def repl(target, extra):
+    import uuid
+    try:
+        import readline  # noqa: F401  (line editing + history)
+    except ImportError:
+        pass
+    session = str(uuid.uuid4())
+    first = True
+    print(f"koen harness → {target} (한글 입력은 싼 모델로 영어 변환 후 전달. /exit 종료)")
+    while True:
+        try:
+            line = input("koen> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not line:
+            continue
+        if line in ("/exit", "/quit"):
+            return
+        if line.startswith("/raw "):
+            prompt = line[5:]
+        else:
+            prompt = translate(line)
+            if prompt != line:
+                print(f"{DIM}→ {prompt}{RESET}")
+        sys.stdout.flush()  # child writes to the same fd; don't let it outrun us
+        try:
+            r = subprocess.run(turn_cmd(target, session, first, extra, prompt))
+        except KeyboardInterrupt:
+            print(f"{DIM}(interrupted){RESET}")
+            continue
+        if r.returncode == 0:
+            first = False  # session established; later turns resume it
+        else:
+            print(f"{DIM}({target} exited {r.returncode}){RESET}", file=sys.stderr)
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] in ("-h", "--help"):
         print(__doc__)
         return
+    if args and args[0] in ("claude", "codex"):
+        extra = args[1:]
+        if extra and extra[0] == "--":
+            extra = extra[1:]
+        return repl(args[0], extra)
     if args and args[0] == "-f":
         text = open(args[1], encoding="utf-8").read()
     elif args:
