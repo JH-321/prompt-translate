@@ -209,9 +209,12 @@ impl Drop for Watchdog {
 }
 fn watchdog(pid: u32, secs: u64) -> Watchdog {
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if secs == 0 {
+        return Watchdog(flag); // KOEN_TIMEOUT=0 disables the timeout
+    }
     let f = flag.clone();
     thread::spawn(move || {
-        for _ in 0..secs * 10 {
+        for _ in 0..secs.saturating_mul(10) {
             thread::sleep(std::time::Duration::from_millis(100));
             if f.load(std::sync::atomic::Ordering::Relaxed) {
                 return; // child already finished
@@ -835,7 +838,9 @@ fn pump(master: libc::c_int, timeout_ms: libc::c_int) -> bool {
         let mut buf = [0u8; 65536];
         let n = unsafe { libc::read(master, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
-            return !is_eagain(); // EAGAIN on the non-blocking master: no data, not EOF
+            // EAGAIN: no data right now, not EOF -> keep going (true).
+            // any other error: treat as EOF so the loop exits (false).
+            return is_eagain();
         }
         if n == 0 {
             return false; // real EOF
