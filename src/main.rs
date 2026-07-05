@@ -849,7 +849,8 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         // Erase what's in the box, then type the English. A pasted line may be
         // collapsed by claude into a [Pasted text] chip whose char count is not
         // ours, so backspacing our count would be wrong — kill the line and
-        // verify it actually emptied; only swap when it did.
+        // verify it actually emptied; only swap when it did. Verified on claude
+        // 2.1.201: Ctrl-U clears both typed text and the [Pasted text] chip.
         let cleared = if paste_seen {
             // Without a reliable empty-prompt baseline we can't confirm a clear,
             // so don't risk killing the line and submitting an empty prompt —
