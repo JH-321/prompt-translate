@@ -50,8 +50,13 @@ Backends (auto-detected, or force with KOEN_BACKEND=claude|codex|openrouter):
 ";
 
 const INSTRUCTION: &str = "You are a translation filter inside an LLM prompt pipeline. \
+The text is a user's instruction or question addressed to an AI coding assistant. \
 Translate the following Korean prompt into concise, precise English.\n\
 Rules:\n\
+- Casual Korean drops question markers. Interrogative words (몇, 뭐, 무엇, 누가, \
+어디, 언제, 왜, 어떻게, 어느) almost always mean the user is ASKING — translate as \
+a question. When a sentence could be a question or a statement, prefer the \
+question: users address requests to the assistant, they do not narrate facts to it.\n\
 - Keep every ⟦K#⟧ placeholder exactly as written, in place.\n\
 - Preserve technical terms, code identifiers, file paths, product names, \
 numbers, and every constraint or requirement. Do not drop nuance.\n\
@@ -967,7 +972,12 @@ fn on_enter(st: &mut Shadow, master: libc::c_int) -> Vec<u8> {
         wr_master(master, b"\r");
         return Vec::new();
     }
+    // Type a busy marker into the box so the held Enter doesn't look dead —
+    // translation takes seconds and the TUI otherwise gives zero feedback.
+    const BUSY: &str = " …번역중";
+    wr_master(master, BUSY.as_bytes());
     let (eng, held) = translate_while_pumping(&text, master);
+    wr_master(master, &vec![0x7f; BUSY.chars().count()]); // erase the marker
     // Ctrl-C during translation: don't swap, don't submit — hand the keys back
     // (the 0x03 reaches claude and clears its box). A clean abort.
     if held.contains(&0x03) {

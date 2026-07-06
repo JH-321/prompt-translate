@@ -100,6 +100,14 @@ Rules of the road:
 | Code fences, `` `inline` ``, `"quotes"`, `'quotes'`, URLs | never sent to the translator, restored verbatim |
 | Translation failure | original line submitted — the session never breaks |
 
+**Enter on a Korean line is held for the translation round-trip** — typically
+5–9 s with the default `claude -p` haiku backend (most of that is CLI
+startup, not the model). The input box shows ` …번역중` while it runs, then
+the line swaps to English and submits; Ctrl-C aborts the translation and
+keeps your line. English and `/` `!` `#` lines submit instantly. If the wait
+bothers you, the OpenRouter backend (`KOEN_BACKEND=openrouter`, direct HTTP,
+no CLI boot) is noticeably faster.
+
 Response translation (claude only) works through a session-scoped Stop hook
 injected at launch — the expensive model answers in English and the cheap
 model's Korean rendering appears natively under it. Codex has no hook
