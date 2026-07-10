@@ -8,6 +8,7 @@ use std::env;
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::mem;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -203,9 +204,10 @@ fn timeout_secs() -> u64 {
     env::var("KOEN_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
 }
 
-/// Kills the child by pid if it outlives `secs`; cancelled on drop so a child
-/// that finishes in time is never touched. Guards against a hung `claude -p` /
-/// `codex exec` freezing the whole harness after Enter.
+/// Kills the child's whole process group if it outlives `secs`; cancelled on
+/// drop so a child that finishes in time is never touched. CLI backends may
+/// spawn helpers which inherit stdout/stderr. Killing only the direct child can
+/// leave those pipes open forever and keep `wait_with_output()` wedged.
 struct Watchdog(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for Watchdog {
     fn drop(&mut self) {
@@ -225,29 +227,40 @@ fn watchdog(pid: u32, secs: u64) -> Watchdog {
                 return; // child already finished
             }
         }
-        // re-check right before killing: the child may have finished (and its pid
-        // been recycled) in the last interval — don't SIGKILL an innocent pid
+        // Every translator is started as the leader of a fresh process group,
+        // so a negative pid terminates it and any helper processes together.
+        // Re-check right before killing: the child may have finished in the last
+        // interval.
         if !f.load(std::sync::atomic::Ordering::Relaxed) {
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
         }
     });
     Watchdog(flag)
 }
 
 fn run_stdin(cmd: &mut Command, input: &str) -> Result<String, String> {
+    run_stdin_with_timeout(cmd, input, timeout_secs())
+}
+
+fn run_stdin_with_timeout(cmd: &mut Command, input: &str, timeout: u64) -> Result<String, String> {
+    // Isolate the backend from koen's pty and make the watchdog able to kill
+    // the complete backend tree, not just its top-level CLI process.
+    cmd.process_group(0);
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
+    // Arm before writing: a backend which never reads a large prompt can block
+    // write_all once the stdin pipe fills.
+    let _guard = watchdog(child.id(), timeout);
     child
         .stdin
         .take()
         .unwrap()
         .write_all(input.as_bytes())
         .map_err(|e| e.to_string())?;
-    let _guard = watchdog(child.id(), timeout_secs());
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -273,6 +286,9 @@ fn backend_codex(instruction: &str, prompt: &str) -> Result<String, String> {
         cmd.args(["-m", &m]);
     }
     cmd.arg(format!("{}{}", instruction, prompt));
+    // A nested `codex exec` must never compete with the harness for raw tty
+    // input. It receives the prompt as an argument and needs no stdin.
+    cmd.stdin(Stdio::null()).process_group(0);
     let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1425,6 +1441,21 @@ mod tests {
     fn passthrough_no_hangul() {
         assert!(!has_hangul("plain english"));
         assert!(has_hangul("한글 있음"));
+    }
+
+    #[test]
+    fn timeout_kills_backend_descendants_holding_output_pipes() {
+        let started = std::time::Instant::now();
+        let result = run_stdin_with_timeout(
+            Command::new("sh").args(["-c", "sleep 30 & wait"]),
+            "prompt",
+            1,
+        );
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "backend descendants kept output pipes open after timeout"
+        );
     }
 
     #[test]
